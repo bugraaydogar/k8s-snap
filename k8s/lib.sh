@@ -174,7 +174,14 @@ k8s::cmd::ctr() {
 # Run kubectl as admin
 # Example: 'k8s::cmd::kubectl get pod,node -A'
 k8s::cmd::kubectl() {
-  env KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}" "${SNAP}/bin/kubectl" "${@}"
+  if grep -q '^confinement: strict$' "${SNAP}/meta/snap.yaml"; then
+    # kubectl plugin discovery lists every PATH directory; the base /usr/sbin
+    # and /usr/games from snapd's default PATH are not listable under strict.
+    # Callers (e.g. wait_kube_apiserver) may run before setup_env.
+    env PATH="${SNAP}/bin:/usr/bin" KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}" "${SNAP}/bin/kubectl" "${@}"
+  else
+    env KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}" "${SNAP}/bin/kubectl" "${@}"
+  fi
 }
 
 # Run k8s CLI
