@@ -31,7 +31,7 @@ parts:
     plugin: nil
     build-snaps:
       - go/1.26-fips/stable
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     build-packages:
       - sudo
       - autoconf
@@ -67,25 +67,12 @@ parts:
     - BASE: core22  # Note: This field must match the base field above.
     - BIN: $CRAFT_STAGE/bin/etcd
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh etcd
-    build-attributes: [enable-patchelf]
-    override-prime: |-
-      case "$CRAFT_ARCH_TRIPLET_BUILD_FOR" in
-        x86_64-linux-gnu|aarch64-linux-gnu)
-          $CRAFT_PROJECT_DIR/build-scripts/hack/patch-elf-with-lief.sh \
-            $BASE $BIN $CRAFT_ARCH_TRIPLET_BUILD_FOR
-          ;;
-        *)
-          # Only amd64/arm64 can use the LIEF-patcher python script above.
-          # Fallback intentionally to snapcraft's patchelf on other architectures.
-          echo "==> Applying Snap-native patchelf"
-          craftctl default
-          ;;
-      esac
+    build-attributes: [no-patchelf]
 
   k8sd:
     after: [build-deps]
     source: build-scripts/components/k8sd
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     plugin: nil
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh k8sd
 
@@ -93,14 +80,14 @@ parts:
     after: [build-deps]
     plugin: nil
     source: build-scripts/components/cni
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh cni
 
   kubernetes:
     after: [build-deps]
     plugin: nil
     source: build-scripts
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh kubernetes
 
   kubernetes-version:
@@ -110,7 +97,7 @@ parts:
 
   helm:
     after: [build-deps]
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     plugin: nil
     source: build-scripts/components/helm
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh helm
@@ -119,7 +106,7 @@ parts:
     after: [build-deps]
     plugin: autotools
     source: https://www.netfilter.org/pub/libmnl/libmnl-1.0.4.tar.bz2
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     prime:
       - -usr/local/include
 
@@ -127,7 +114,7 @@ parts:
     after: [libmnl]
     plugin: autotools
     source: https://www.netfilter.org/projects/libnftnl/files/libnftnl-1.1.8.tar.bz2
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     build-environment:
       - LIBMNL_LIBS: $CRAFT_STAGE/usr/lib
     prime:
@@ -137,7 +124,7 @@ parts:
     after: [libnftnl]
     source: https://www.netfilter.org/projects/iptables/files/iptables-1.8.6.tar.bz2
     plugin: autotools
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     build-environment:
       - LIBMNL_LIBS: $CRAFT_STAGE/usr/lib
       - LIBNFTNL_LIBS: $CRAFT_STAGE/usr/lib
@@ -158,33 +145,18 @@ parts:
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh containerd
     build-environment:
     - BASE: core22  # Note: This field must match the base field above.
-    build-attributes: [enable-patchelf]
-    override-prime: |-
-      case "$CRAFT_ARCH_TRIPLET_BUILD_FOR" in
-        x86_64-linux-gnu|aarch64-linux-gnu)
-          for BIN in containerd ctr containerd-shim-runc-v2; do
-            $CRAFT_PROJECT_DIR/build-scripts/hack/patch-elf-with-lief.sh \
-                $BASE $CRAFT_STAGE/bin/$BIN $CRAFT_ARCH_TRIPLET_BUILD_FOR
-          done
-          ;;
-        *)
-          # Only amd64/arm64 can use the LIEF-patcher python script above.
-          # Fallback intentionally to snapcraft's patchelf on other architectures.
-          echo "==> Applying Snap-native patchelf"
-          craftctl default
-          ;;
-      esac
+    build-attributes: [no-patchelf]
 
   runc:
     after: [iptables, build-deps]
     plugin: nil
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     source: build-scripts/components/runc
     override-build: $CRAFT_PROJECT_DIR/build-scripts/build-component.sh runc
 
   bash-utils:
     plugin: nil
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     stage-packages:
       - conntrack
       - coreutils
@@ -232,7 +204,7 @@ parts:
   k8s:
     plugin: nil
     source: k8s
-    build-attributes: [enable-patchelf]
+    build-attributes: [no-patchelf]
     override-build: |
       rm $CRAFT_PART_INSTALL/k8s -rf
       cp --archive --link --no-dereference . $CRAFT_PART_INSTALL/k8s
