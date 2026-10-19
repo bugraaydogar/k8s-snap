@@ -320,36 +320,22 @@ apps:
     daemon: simple
     before: [kubelet, kube-controller-manager, kube-proxy, kube-scheduler]
     stop-timeout: 5s
+    # Plain network daemons: no container, mount or firewall privileges.
     plugs:
-      - docker-privileged
-      - firewall-control
-      - hardware-observe
-      - kernel-module-observe
-      - kubernetes-support
-      - mount-observe
+      - network
       - network-bind
-      - network-control
       - network-observe
-      - opengl
-      - process-control
       - system-observe
   kube-controller-manager:
     install-mode: disable
     command: k8s/wrappers/services/kube-controller-manager
     daemon: simple
     after: [kube-apiserver]
+    # Plain network daemons: no container, mount or firewall privileges.
     plugs:
-      - docker-privileged
-      - firewall-control
-      - hardware-observe
-      - kernel-module-observe
-      - kubernetes-support
-      - mount-observe
+      - network
       - network-bind
-      - network-control
       - network-observe
-      - opengl
-      - process-control
       - system-observe
   kube-proxy:
     install-mode: disable
@@ -374,18 +360,11 @@ apps:
     command: k8s/wrappers/services/kube-scheduler
     daemon: simple
     after: [kube-apiserver]
+    # Plain network daemons: no container, mount or firewall privileges.
     plugs:
-      - docker-privileged
-      - firewall-control
-      - hardware-observe
-      - kernel-module-observe
-      - kubernetes-support
-      - mount-observe
+      - network
       - network-bind
-      - network-control
       - network-observe
-      - opengl
-      - process-control
       - system-observe
   k8s-apiserver-proxy:
     install-mode: disable
@@ -413,17 +392,10 @@ layout:
   # CNI and compatibility paths.
   /var/lib/cni:
     bind: $SNAP_COMMON/var/lib/cni
-  /var/lib/calico:
-    bind: $SNAP_COMMON/var/lib/calico
-  # Extras
-  /usr/local:
-    bind: $SNAP_COMMON/usr/local
   /usr/libexec:
     bind: $SNAP_COMMON/usr/libexec
   /var/lib/kube-proxy:
     bind: $SNAP_COMMON/var/lib/kube-proxy
-  /etc/service/enabled:
-    bind: $SNAP_COMMON/etc/service/enabled
   /etc/nanorc:
     bind-file: $SNAP_COMMON/etc/nanorc
 
