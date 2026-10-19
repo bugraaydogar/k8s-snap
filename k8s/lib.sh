@@ -12,8 +12,23 @@ k8s::common::setup_env() {
   local SNAP_CURRENT="${SNAP%"${SNAP_REVISION}"}current"
 
   # Configure PATH, LD_LIBRARY_PATH
-  export PATH="$SNAP_CURRENT/usr/bin:$SNAP_CURRENT/bin:$SNAP_CURRENT/usr/sbin:$SNAP_CURRENT/sbin:$REAL_PATH"
-  export LD_LIBRARY_PATH="$SNAP_LIBRARY_PATH:$SNAP_CURRENT/lib:$SNAP_CURRENT/usr/lib:$SNAP_CURRENT/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/ceph:${REAL_LD_LIBRARY_PATH:-}"
+  if grep -q '^confinement: strict$' "${SNAP}/meta/snap.yaml"; then
+    # The base snap is the rootfs; host PATH/library tails do not apply.
+    # snapd's default PATH also carries /usr/games, /sbin and /usr/local/*.
+    # Services keep the base /usr/sbin (k8sd execs losetup etc. by name).
+    # The CLI drops it: kubectl plugin discovery lists every PATH directory
+    # and AppArmor denies listing /usr/sbin.
+    local base_path="/usr/bin:/usr/sbin"
+    if [ -n "${K8S_STRICT_CLI:-}" ]; then
+      base_path="/usr/bin"
+    fi
+    export PATH="$SNAP_CURRENT/usr/bin:$SNAP_CURRENT/bin:$SNAP_CURRENT/usr/sbin:$SNAP_CURRENT/sbin:$base_path"
+    export LD_LIBRARY_PATH="$SNAP_LIBRARY_PATH:$SNAP_CURRENT/lib:$SNAP_CURRENT/usr/lib:$SNAP_CURRENT/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/ceph"
+    export OPENSSL_MODULES="/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/ossl-modules/"
+  else
+    export PATH="$SNAP_CURRENT/usr/bin:$SNAP_CURRENT/bin:$SNAP_CURRENT/usr/sbin:$SNAP_CURRENT/sbin:$REAL_PATH"
+    export LD_LIBRARY_PATH="$SNAP_LIBRARY_PATH:$SNAP_CURRENT/lib:$SNAP_CURRENT/usr/lib:$SNAP_CURRENT/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP_CURRENT/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/ceph:${REAL_LD_LIBRARY_PATH:-}"
+  fi
 
   # NOTE(neoaggelos/2023-08-14):
   # we cannot list system locales from snap. instead, we attempt

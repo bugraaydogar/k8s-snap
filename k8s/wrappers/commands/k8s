@@ -2,4 +2,7 @@
 
 . "$SNAP/k8s/lib.sh"
 
+# See k8s::common::setup_env: keep base /usr/sbin off the CLI PATH (strict).
+export K8S_STRICT_CLI=1
+
 k8s::common::execute k8s "${@}"
