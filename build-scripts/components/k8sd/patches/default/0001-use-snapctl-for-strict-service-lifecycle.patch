@@ -1,0 +1,243 @@
+From: K8s builder bot <k8s-bot@canonical.com>
+Subject: [PATCH] use snapctl for strict service lifecycle
+
+Strict snaps should manage their own services through snapctl rather
+than by shelling out to the host snap command. Keep the existing snap
+command path for classic confinement, but switch strict confinement to
+snapctl start, stop, and restart.
+
+The k8sd pre-remove path is the only current service lifecycle caller
+that passes --no-wait. snapctl service commands do not support that snap
+CLI flag, so strict pre-remove stops services synchronously and logs
+that decision.
+---
+ pkg/k8sd/app/hooks_remove.go |   7 ++-
+ pkg/snap/snap.go             |   7 ++-
+ pkg/snap/snap_test.go        | 100 ++++++++++++++++++++++++++++++-----
+ 3 files changed, 98 insertions(+), 16 deletions(-)
+
+diff --git a/pkg/k8sd/app/hooks_remove.go b/pkg/k8sd/app/hooks_remove.go
+index c593a86..7764e34 100644
+--- a/pkg/k8sd/app/hooks_remove.go
++++ b/pkg/k8sd/app/hooks_remove.go
+@@ -92,7 +92,12 @@ func (a *App) onPreRemove(ctx context.Context, s mctypes.State, force bool) (rer
+ 			cleanup.SyncISCSIDevices(ctx)
+ 
+ 			log.Info("Stopping all services except k8sd")
+-			if err := snaputil.StopK8sServices(ctx, snap, "--no-wait"); err != nil {
++			stopArgs := []string{"--no-wait"}
++			if snap.Strict() {
++				log.Info("Strict confinement uses snapctl service control, stopping services synchronously")
++				stopArgs = nil
++			}
++			if err := snaputil.StopK8sServices(ctx, snap, stopArgs...); err != nil {
+ 				log.Error(err, "failed to stop k8s services")
+ 			}
+ 
+diff --git a/pkg/snap/snap.go b/pkg/snap/snap.go
+index a0a778b..4f506d4 100644
+--- a/pkg/snap/snap.go
++++ b/pkg/snap/snap.go
+@@ -76,7 +76,12 @@ func NewSnap(opts SnapOpts) *snap {
+ 
+ // buildServiceCommand creates a snap command for managing services.
+ func (s *snap) buildServiceCommand(action string, names []string, extraSnapArgs ...string) []string {
+-	cmd := []string{"snap", action}
++	command := "snap"
++	if s.Strict() {
++		command = "snapctl"
++	}
++
++	cmd := []string{command, action}
+ 	for _, name := range names {
+ 		cmd = append(cmd, serviceName(name))
+ 	}
+diff --git a/pkg/snap/snap_test.go b/pkg/snap/snap_test.go
+index 602ca8b..189a529 100644
+--- a/pkg/snap/snap_test.go
++++ b/pkg/snap/snap_test.go
+@@ -44,7 +44,7 @@ func TestSnap(t *testing.T) {
+ 			g.Expect(err).To(Not(HaveOccurred()))
+ 			defer os.RemoveAll(tmpDir)
+ 
+-			err = os.MkdirAll(filepath.Join(tmpDir, "meta"), os.ModeDir)
++			err = os.MkdirAll(filepath.Join(tmpDir, "meta"), 0o755)
+ 			g.Expect(err).To(Not(HaveOccurred()))
+ 
+ 			snapData := []byte("confinement: strict\n")
+@@ -65,26 +65,50 @@ func TestSnap(t *testing.T) {
+ 	t.Run("Start", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		mockRunner := &mock.Runner{}
+-		snap := snap.NewSnap(snap.SnapOpts{
++		classicSnap := snap.NewSnap(snap.SnapOpts{
+ 			SnapDir:       "testdir",
+ 			SnapCommonDir: "testdir",
+ 			RunCommand:    mockRunner.Run,
+ 		})
+ 
+-		err := snap.StartServices(context.Background(), []string{"test-service"})
++		err := classicSnap.StartServices(context.Background(), []string{"test-service"})
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap start k8s.test-service --enable"))
+ 
+ 		mockRunner.CalledWithCommand = []string{}
+-		err = snap.StartServices(context.Background(), []string{"test-service"}, "--no-wait")
++		err = classicSnap.StartServices(context.Background(), []string{"test-service"}, "--no-wait")
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap start k8s.test-service --enable --no-wait"))
+ 
++		t.Run("Strict", func(t *testing.T) {
++			g := NewWithT(t)
++			tmpDir, err := os.MkdirTemp("", "test-snap-k8s-strict")
++			g.Expect(err).To(Not(HaveOccurred()))
++			defer os.RemoveAll(tmpDir)
++
++			err = os.MkdirAll(filepath.Join(tmpDir, "meta"), 0o755)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			err = os.WriteFile(filepath.Join(tmpDir, "meta", "snap.yaml"), []byte("confinement: strict\n"), 0o644)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			mockRunner := &mock.Runner{}
++			snap := snap.NewSnap(snap.SnapOpts{
++				SnapDir:       tmpDir,
++				SnapCommonDir: tmpDir,
++				RunCommand:    mockRunner.Run,
++			})
++
++			err = snap.StartServices(context.Background(), []string{"test-service"})
++			g.Expect(err).To(Not(HaveOccurred()))
++			g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snapctl start k8s.test-service --enable"))
++		})
++
+ 		t.Run("Fail", func(t *testing.T) {
+ 			g := NewWithT(t)
+ 			mockRunner.Err = fmt.Errorf("some error")
+ 
+-			err := snap.StartServices(context.Background(), []string{"test-service"})
++			err := classicSnap.StartServices(context.Background(), []string{"test-service"})
+ 			g.Expect(err).To(HaveOccurred())
+ 		})
+ 	})
+@@ -92,25 +116,49 @@ func TestSnap(t *testing.T) {
+ 	t.Run("Stop", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		mockRunner := &mock.Runner{}
+-		snap := snap.NewSnap(snap.SnapOpts{
++		classicSnap := snap.NewSnap(snap.SnapOpts{
+ 			SnapDir:       "testdir",
+ 			SnapCommonDir: "testdir",
+ 			RunCommand:    mockRunner.Run,
+ 		})
+-		err := snap.StopServices(context.Background(), []string{"test-service"})
++		err := classicSnap.StopServices(context.Background(), []string{"test-service"})
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap stop k8s.test-service --disable"))
+ 
+ 		mockRunner.CalledWithCommand = []string{}
+-		err = snap.StopServices(context.Background(), []string{"test-service"}, "--no-wait")
++		err = classicSnap.StopServices(context.Background(), []string{"test-service"}, "--no-wait")
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap stop k8s.test-service --disable --no-wait"))
+ 
++		t.Run("Strict", func(t *testing.T) {
++			g := NewWithT(t)
++			tmpDir, err := os.MkdirTemp("", "test-snap-k8s-strict")
++			g.Expect(err).To(Not(HaveOccurred()))
++			defer os.RemoveAll(tmpDir)
++
++			err = os.MkdirAll(filepath.Join(tmpDir, "meta"), 0o755)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			err = os.WriteFile(filepath.Join(tmpDir, "meta", "snap.yaml"), []byte("confinement: strict\n"), 0o644)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			mockRunner := &mock.Runner{}
++			snap := snap.NewSnap(snap.SnapOpts{
++				SnapDir:       tmpDir,
++				SnapCommonDir: tmpDir,
++				RunCommand:    mockRunner.Run,
++			})
++
++			err = snap.StopServices(context.Background(), []string{"test-service"})
++			g.Expect(err).To(Not(HaveOccurred()))
++			g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snapctl stop k8s.test-service --disable"))
++		})
++
+ 		t.Run("Fail", func(t *testing.T) {
+ 			g := NewWithT(t)
+ 			mockRunner.Err = fmt.Errorf("some error")
+ 
+-			err := snap.StartServices(context.Background(), []string{"test-service"})
++			err := classicSnap.StopServices(context.Background(), []string{"test-service"})
+ 			g.Expect(err).To(HaveOccurred())
+ 		})
+ 	})
+@@ -118,26 +166,50 @@ func TestSnap(t *testing.T) {
+ 	t.Run("Restart", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		mockRunner := &mock.Runner{}
+-		snap := snap.NewSnap(snap.SnapOpts{
++		classicSnap := snap.NewSnap(snap.SnapOpts{
+ 			SnapDir:       "testdir",
+ 			SnapCommonDir: "testdir",
+ 			RunCommand:    mockRunner.Run,
+ 		})
+ 
+-		err := snap.RestartServices(context.Background(), []string{"test-service"})
++		err := classicSnap.RestartServices(context.Background(), []string{"test-service"})
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap restart k8s.test-service"))
+ 
+ 		mockRunner.CalledWithCommand = []string{}
+-		err = snap.RestartServices(context.Background(), []string{"test-service"}, "--no-wait")
++		err = classicSnap.RestartServices(context.Background(), []string{"test-service"}, "--no-wait")
+ 		g.Expect(err).To(Not(HaveOccurred()))
+ 		g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snap restart k8s.test-service --no-wait"))
+ 
++		t.Run("Strict", func(t *testing.T) {
++			g := NewWithT(t)
++			tmpDir, err := os.MkdirTemp("", "test-snap-k8s-strict")
++			g.Expect(err).To(Not(HaveOccurred()))
++			defer os.RemoveAll(tmpDir)
++
++			err = os.MkdirAll(filepath.Join(tmpDir, "meta"), 0o755)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			err = os.WriteFile(filepath.Join(tmpDir, "meta", "snap.yaml"), []byte("confinement: strict\n"), 0o644)
++			g.Expect(err).To(Not(HaveOccurred()))
++
++			mockRunner := &mock.Runner{}
++			snap := snap.NewSnap(snap.SnapOpts{
++				SnapDir:       tmpDir,
++				SnapCommonDir: tmpDir,
++				RunCommand:    mockRunner.Run,
++			})
++
++			err = snap.RestartServices(context.Background(), []string{"test-service"})
++			g.Expect(err).To(Not(HaveOccurred()))
++			g.Expect(mockRunner.CalledWithCommand).To(ConsistOf("snapctl restart k8s.test-service"))
++		})
++
+ 		t.Run("Fail", func(t *testing.T) {
+ 			g := NewWithT(t)
+ 			mockRunner.Err = fmt.Errorf("some error")
+ 
+-			err := snap.StartServices(context.Background(), []string{"service"})
++			err := classicSnap.RestartServices(context.Background(), []string{"service"})
+ 			g.Expect(err).To(HaveOccurred())
+ 		})
+ 	})
+@@ -185,7 +257,7 @@ func TestSnap(t *testing.T) {
+ 		t.Run("Fail socket exists", func(t *testing.T) {
+ 			g := NewWithT(t)
+ 			// Create the containerd.sock file, which should cause the check to fail.
+-			err := os.MkdirAll(snap.ContainerdSocketDir(), os.ModeDir)
++			err := os.MkdirAll(snap.ContainerdSocketDir(), 0o755)
+ 			g.Expect(err).To(Not(HaveOccurred()))
+ 			f, err := os.Create(snap.ContainerdSocketPath())
+ 			g.Expect(err).To(Not(HaveOccurred()))
+-- 
+2.43.0
+

@@ -1,0 +1,144 @@
+From: K8s builder bot <k8s-bot@canonical.com>
+Subject: [PATCH] fix: use host-visible CNI paths in strict snaps
+
+---
+ pkg/k8sd/features/cilium/cni_paths_test.go | 56 ++++++++++++++++++++++
+ pkg/k8sd/features/cilium/network.go        |  2 +-
+ pkg/snap/cni_paths_test.go                 | 32 +++++++++++++
+ pkg/snap/snap.go                           |  5 ++
+ 4 files changed, 94 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/k8sd/features/cilium/cni_paths_test.go
+ create mode 100644 pkg/snap/cni_paths_test.go
+
+diff --git a/pkg/k8sd/features/cilium/cni_paths_test.go b/pkg/k8sd/features/cilium/cni_paths_test.go
+new file mode 100644
+index 0000000..cd8dc1a
+--- /dev/null
++++ b/pkg/k8sd/features/cilium/cni_paths_test.go
+@@ -0,0 +1,56 @@
++package cilium_test
++
++import (
++	"context"
++	"errors"
++	"net/url"
++	"testing"
++
++	helmmock "github.com/canonical/k8sd/pkg/client/helm/mock"
++	"github.com/canonical/k8sd/pkg/k8sd/features/cilium"
++	"github.com/canonical/k8sd/pkg/k8sd/types"
++	snapmock "github.com/canonical/k8sd/pkg/snap/mock"
++	"github.com/canonical/k8sd/pkg/utils"
++	mctypes "github.com/canonical/microcluster/v3/microcluster/types"
++	"k8s.io/utils/ptr"
++)
++
++type cniPathState struct{ mctypes.State }
++
++func (cniPathState) Address() *url.URL { return &url.URL{Host: "127.0.0.1:6400"} }
++
++func TestNetworkUsesSnapCNIBinDir(t *testing.T) {
++	oldMountPath, oldPropagation := cilium.GetMountPath, cilium.GetMountPropagationType
++	t.Cleanup(func() {
++		cilium.GetMountPath, cilium.GetMountPropagationType = oldMountPath, oldPropagation
++	})
++	cilium.GetMountPath = func(fs string) (string, error) { return "/sys/fs/" + fs, nil }
++	cilium.GetMountPropagationType = func(string) (utils.MountPropagationType, error) {
++		return utils.MountPropagationShared, nil
++	}
++	for _, test := range []struct {
++		name, binDir string
++		strict       bool
++	}{
++		{name: "classic", binDir: "/opt/cni/bin"},
++		{name: "strict", binDir: "/var/snap/k8s/common/opt/cni/bin", strict: true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			stopAfterApply := errors.New("stop after recording chart values")
++			helm := &helmmock.Mock{ApplyErr: stopAfterApply}
++			s := &snapmock.Snap{Mock: snapmock.Mock{
++				HelmClient: helm, Strict: test.strict, CNIBinDir: test.binDir,
++			}}
++			_, err := cilium.ApplyNetwork(context.Background(), s, cniPathState{},
++				types.APIServer{SecurePort: ptr.To(6443)},
++				types.Network{Enabled: ptr.To(true), PodCIDR: ptr.To("10.1.0.0/16")}, nil)
++			if !errors.Is(err, stopAfterApply) || len(helm.ApplyCalledWith) != 1 {
++				t.Fatalf("expected chart application; calls=%d, err=%v", len(helm.ApplyCalledWith), err)
++			}
++			values := helm.ApplyCalledWith[0].Values
++			if got := values["cni"].(map[string]any)["binPath"]; got != test.binDir {
++				t.Fatalf("Cilium binPath = %q, want snap CNI directory %q", got, test.binDir)
++			}
++		})
++	}
++}
+diff --git a/pkg/k8sd/features/cilium/network.go b/pkg/k8sd/features/cilium/network.go
+index ab20a1b..3142ff9 100644
+--- a/pkg/k8sd/features/cilium/network.go
++++ b/pkg/k8sd/features/cilium/network.go
+@@ -156,7 +156,7 @@ func ApplyNetwork(ctx context.Context, snap snap.Snap, s mctypes.State, apiserve
+ 		},
+ 		"cni": map[string]any{
+ 			"confPath":     "/etc/cni/net.d",
+-			"binPath":      "/opt/cni/bin",
++			"binPath":      snap.CNIBinDir(),
+ 			"exclusive":    config.cniExclusive,
+ 			"chainingMode": "portmap",
+ 		},
+diff --git a/pkg/snap/cni_paths_test.go b/pkg/snap/cni_paths_test.go
+new file mode 100644
+index 0000000..307d3e1
+--- /dev/null
++++ b/pkg/snap/cni_paths_test.go
+@@ -0,0 +1,32 @@
++package snap_test
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/canonical/k8sd/pkg/snap"
++)
++
++func TestCNIBinDirVisibleOnHost(t *testing.T) {
++	for _, confinement := range []string{"classic", "strict"} {
++		t.Run(confinement, func(t *testing.T) {
++			snapDir := t.TempDir()
++			if err := os.Mkdir(filepath.Join(snapDir, "meta"), 0o755); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(filepath.Join(snapDir, "meta", "snap.yaml"), []byte("confinement: "+confinement+"\n"), 0o644); err != nil {
++				t.Fatal(err)
++			}
++			commonDir := filepath.Join(t.TempDir(), "common")
++			s := snap.NewSnap(snap.SnapOpts{SnapDir: snapDir, SnapCommonDir: commonDir})
++			want := "/opt/cni/bin"
++			if confinement == "strict" {
++				want = filepath.Join(commonDir, "opt", "cni", "bin")
++			}
++			if got := s.CNIBinDir(); got != want {
++				t.Fatalf("CNIBinDir() = %q, want host-visible path %q", got, want)
++			}
++		})
++	}
++}
+diff --git a/pkg/snap/snap.go b/pkg/snap/snap.go
+index 4f506d4..8674ebf 100644
+--- a/pkg/snap/snap.go
++++ b/pkg/snap/snap.go
+@@ -254,6 +254,11 @@ func (s *snap) CNIConfDir() string {
+ }
+ 
+ func (s *snap) CNIBinDir() string {
++	if s.Strict() {
++		// Cilium also executes CNI helpers in the host mount namespace, where
++		// the snap's /opt/cni/bin layout is not visible.
++		return filepath.Join(s.snapCommonDir, "opt", "cni", "bin")
++	}
+ 	return "/opt/cni/bin"
+ }
+ 
+-- 
+2.43.0
+

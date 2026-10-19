@@ -77,60 +77,82 @@ k8s::common::on_fips_host() {
 k8s::remove::network() {
   k8s::common::setup_env
 
-  k8s::cmd::k8s x-cleanup network || true
+  if ! k8s::cmd::k8s x-cleanup network; then
+    echo "Warning: network cleanup failed; continuing snap removal." >&2
+  fi
 }
 
 # [DANGER] Cleanup containers and runtime state. Note that the order of operations below is crucial.
 k8s::remove::containers() {
   k8s::common::setup_env
 
-  k8s::cmd::k8s x-cleanup containers || true
+  if ! k8s::cmd::k8s x-cleanup containers; then
+    echo "Warning: containers cleanup failed; continuing snap removal." >&2
+  fi
 }
 
 k8s::remove::containerd() {
   k8s::common::setup_env
 
-  k8s::cmd::k8s x-cleanup containerd || true
+  if ! k8s::cmd::k8s x-cleanup containerd; then
+    echo "Warning: containerd cleanup failed; continuing snap removal." >&2
+  fi
 }
 
-# Cleanup systemd overrides
+# Remove host sysctl settings installed by the classic snap.
+# Example: 'k8s::remove::system_tuning'
 k8s::remove::system_tuning() {
   if ! k8s::common::is_strict; then
     # Find files matching pattern: digits followed by '-k8s.conf'
-    files_to_remove=$(find /etc/sysctl.d/ -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-k8s\.conf')
-
+    local files_to_remove
+    files_to_remove=$(find /etc/sysctl.d/ -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-k8s\.conf') || return
 
     if [ -n "$files_to_remove" ]; then
-      echo "$files_to_remove" | xargs sudo rm -f
-      sudo sysctl --system
+      echo "$files_to_remove" | xargs rm -f -- || return
+      sysctl --system
     fi
   fi
 }
 
+# Remove snap-owned configuration; removal hooks already run as root.
+# Example: 'k8s::remove::resources'
 k8s::remove::resources() {
-  if [ -d "$SNAP_COMMON/etc" ]; then
-    sudo rm -rf "$SNAP_COMMON/etc"
-  fi
+  rm -rf -- "${SNAP_COMMON:?SNAP_COMMON must be set}/etc"
 }
 
+# Remove snap-owned kubelet logs for either confinement mode.
+# Example: 'k8s::remove::kubelet_logs'
 k8s::remove::kubelet_logs() {
-  if ! k8s::common::is_strict; then
-    if [ -d "$SNAP_COMMON/var/log/pods" ]; then
-        sudo rm -rf "$SNAP_COMMON/var/log/pods"
-    fi
-
-    if [ -d "$SNAP_COMMON/var/log/containers" ]; then
-      sudo rm -rf "$SNAP_COMMON/var/log/containers"
-    fi
-  fi
+  rm -rf -- "${SNAP_COMMON:?SNAP_COMMON must be set}/var/log/pods" "$SNAP_COMMON/var/log/containers"
 }
 
 # Run a ctr command against the local containerd socket
 # Example: 'k8s::cmd::ctr image ls -q'
 k8s::cmd::ctr() {
+  local containerd_address="${CONTAINERD_ADDRESS:-}"
+  if [ -z "$containerd_address" ]; then
+    local containerd_base_dir_lock="$SNAP_COMMON/lock/.containerd-base-dir"
+    if [ -e "$containerd_base_dir_lock" ]; then
+      local containerd_base_dir
+      if ! containerd_base_dir="$(cat "$containerd_base_dir_lock")"; then
+        echo "Failed to read containerd base dir from $containerd_base_dir_lock" >&2
+        return 1
+      fi
+      if [ -z "$containerd_base_dir" ] || [ "${containerd_base_dir#/}" = "$containerd_base_dir" ]; then
+        echo "Invalid containerd base dir in $containerd_base_dir_lock: $containerd_base_dir" >&2
+        return 1
+      fi
+      containerd_address="$containerd_base_dir/run/containerd/containerd.sock"
+    elif k8s::common::is_strict; then
+      containerd_address="$SNAP_COMMON/run/containerd/containerd.sock"
+    else
+      containerd_address="/run/containerd/containerd.sock"
+    fi
+  fi
+
   env \
     CONTAINERD_NAMESPACE="${CONTAINERD_NAMESPACE:-k8s.io}" \
-    CONTAINERD_ADDRESS="${CONTAINERD_ADDRESS:-$SNAP_COMMON/run/containerd.sock}" \
+    CONTAINERD_ADDRESS="$containerd_address" \
     "${SNAP}/bin/ctr" "${@}"
 }
 
@@ -165,7 +187,7 @@ k8s::util::default_interface() {
 # Wait for containerd socket to be ready
 # Example: 'k8s::util::wait_containerd_socket'
 k8s::util::wait_containerd_socket() {
-  while ! k8s::cmd::ctr --connect-timeout 1s > /dev/null; do
+  while ! k8s::cmd::ctr --connect-timeout 1s version > /dev/null; do
     echo Waiting for containerd to start
     sleep 3
   done
@@ -289,6 +311,12 @@ k8s::util::load_kernel_modules() {
 
 k8s::containerd::ensure_systemd_defaults() {
   k8s::common::setup_env
+
+  # Strict hooks cannot write host systemd units. Snapd supplies service
+  # settings through interfaces; the classic drop-in is not installed here.
+  if k8s::common::is_strict; then
+    return 0
+  fi
 
   local override_dir="/etc/systemd/system/snap.k8s.containerd.service.d"
   local override_file="$SNAP/k8s/systemd/containerd-defaults.conf"

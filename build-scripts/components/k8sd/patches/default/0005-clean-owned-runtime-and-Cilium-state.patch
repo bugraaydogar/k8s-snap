@@ -1,0 +1,1389 @@
+From: K8s builder bot <k8s-bot@canonical.com>
+Subject: [PATCH] fix: clean owned runtime and Cilium state during removal
+
+---
+diff --git a/cmd/k8s/k8s_x_cleanup.go b/cmd/k8s/k8s_x_cleanup.go
+index 1023382..e8d3c0d 100644
+--- a/cmd/k8s/k8s_x_cleanup.go
++++ b/cmd/k8s/k8s_x_cleanup.go
+@@ -41,7 +41,10 @@ func newXCleanupCmd(env cmdutil.ExecutionEnvironment) *cobra.Command {
+ 			ctx, cancel := context.WithTimeout(cmd.Context(), opts.timeout)
+ 			defer cancel()
+ 
+-			cleanup.TryCleanupContainers(ctx, env.Snap)
++			if err := cleanup.TryCleanupContainers(ctx, env.Snap); err != nil {
++				cmd.PrintErrf("Error: failed to cleanup containers: %v\n", err)
++				env.Exit(1)
++			}
+ 		},
+ 	}
+ 	cleanupContainersCmd.Flags().DurationVar(&opts.timeout, "timeout", 5*time.Minute, "the max time to wait for the command to execute")
+diff --git a/pkg/k8sd/features/cilium/cleanup.go b/pkg/k8sd/features/cilium/cleanup.go
+index be16071..82677da 100644
+--- a/pkg/k8sd/features/cilium/cleanup.go
++++ b/pkg/k8sd/features/cilium/cleanup.go
+@@ -2,27 +2,30 @@ package cilium
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"strings"
++	"syscall"
++	"time"
+ 
+ 	"github.com/canonical/k8sd/pkg/snap"
++	"github.com/moby/sys/mountinfo"
+ )
+ 
+ func CleanupNetwork(ctx context.Context, snap snap.Snap) error {
+-	os.Remove("/var/run/cilium/cilium.pid")
+-
+-	if _, err := os.Stat("/opt/cni/bin/cilium-dbg"); err == nil {
+-		if err := exec.CommandContext(ctx, "/opt/cni/bin/cilium-dbg", "post-uninstall-cleanup", "--all-state", "--force").Run(); err != nil {
+-			return fmt.Errorf("cilium-dbg cleanup failed: %w", err)
+-		}
++	var errs []error
++	if err := cleanupCiliumState(ctx, snap); err != nil {
++		errs = append(errs, err)
+ 	}
+ 
+ 	for _, cmd := range []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"} {
+-		out, err := exec.Command(fmt.Sprintf("%s-save", cmd)).Output()
++		out, err := exec.CommandContext(ctx, fmt.Sprintf("%s-save", cmd)).Output()
+ 		if err != nil {
+-			return fmt.Errorf("failed to read iptables rules: %w", err)
++			errs = append(errs, fmt.Errorf("failed to read %s rules: %w", cmd, err))
++			continue
+ 		}
+ 
+ 		lines := strings.Split(string(out), "\n")
+@@ -32,12 +35,82 @@ func CleanupNetwork(ctx context.Context, snap snap.Snap) error {
+ 			}
+ 		}
+ 
+-		restore := exec.Command(fmt.Sprintf("%s-restore", cmd))
++		restore := exec.CommandContext(ctx, fmt.Sprintf("%s-restore", cmd))
+ 		restore.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+ 		if err := restore.Run(); err != nil {
+-			return fmt.Errorf("failed to restore iptables rules: %w", err)
++			errs = append(errs, fmt.Errorf("failed to restore %s rules: %w", cmd, err))
++		}
++	}
++
++	return errors.Join(errs...)
++}
++
++func cleanupCiliumState(ctx context.Context, snap snap.Snap) error {
++	return cleanupCiliumStateWith(ctx, snap, os.Lstat, runCiliumCleanup, func() error {
++		return removeCiliumDirectories([]string{"/run/cilium", "/var/lib/cilium"}, mountinfo.GetMounts)
++	})
++}
++
++func cleanupCiliumStateWith(ctx context.Context, snap snap.Snap, statHelper func(string) (os.FileInfo, error), runCleanup func(context.Context, string, string) error, removeDirectories func() error) error {
++	helper := filepath.Join(snap.CNIBinDir(), "cilium-dbg")
++	info, err := statHelper(helper)
++	if errors.Is(err, os.ErrNotExist) {
++		if snap.Strict() {
++			if _, cniErr := os.Stat(filepath.Join(snap.CNIBinDir(), "cilium-cni")); cniErr == nil {
++				return fmt.Errorf("Cilium cleanup helper is missing: %s", helper)
++			} else if !errors.Is(cniErr, os.ErrNotExist) {
++				return cniErr
++			}
++		}
++		return nil
++	}
++	if err != nil {
++		return fmt.Errorf("read Cilium cleanup helper: %w", err)
++	}
++	if snap.Strict() {
++		if err := validateCleanupHelper(info); err != nil {
++			return err
+-		}
++		}
+-	}
++	}
++	cleanupErr := runCleanup(ctx, helper, "/var/run/cilium/cilium.pid")
++	if snap.Strict() {
++		// Upstream RemoveAll needs to read /var/run and /var/lib. Strict hooks
++		// only have access to Cilium's own directories, so finish from inside them.
++		return errors.Join(cleanupErr, removeDirectories())
++	}
++	return cleanupErr
++}
++
++func validateCleanupHelper(info os.FileInfo) error {
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || info.Mode().Perm()&0o100 == 0 || !ok || stat.Uid != 0 {
++		return fmt.Errorf("Cilium cleanup helper must be a root-owned executable, not writable by group or others")
++	}
++	return nil
++}
+-
++
++func runCiliumCleanup(ctx context.Context, helper, pidFile string) error {
++	if err := os.Remove(pidFile); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("remove stopped Cilium PID file: %w", err)
++	}
++	cmd := exec.CommandContext(ctx, helper, "post-uninstall-cleanup", "--all-state", "--force")
++	// Go's default cancellation uses pidfd_send_signal, unavailable in older
++	// strict seccomp policies. This PID is our own unreaped child.
++	cmd.Cancel = func() error {
++		if err := syscall.Kill(cmd.Process.Pid, syscall.SIGKILL); err != nil {
++			if errors.Is(err, syscall.ESRCH) {
++				return os.ErrProcessDone
++			}
++			return err
++		}
++		return nil
++	}
++	cmd.WaitDelay = time.Second
++	// Cilium reports individual cleanup failures on stderr even when it exits
++	// successfully. Preserve diagnostics; residual-state tests verify teardown.
++	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
++	if err := cmd.Run(); err != nil {
++		return fmt.Errorf("cilium-dbg cleanup failed: %w", err)
++	}
+ 	return nil
+ }
+diff --git a/pkg/k8sd/features/cilium/cleanup_directories.go b/pkg/k8sd/features/cilium/cleanup_directories.go
+new file mode 100644
+index 0000000..092086e
+--- /dev/null
++++ b/pkg/k8sd/features/cilium/cleanup_directories.go
+@@ -0,0 +1,94 @@
++package cilium
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/moby/sys/mountinfo"
++)
++
++func removeCiliumDirectories(paths []string, readMounts func(mountinfo.FilterFunc) ([]*mountinfo.Info, error)) error {
++	mounts, err := readMounts(nil)
++	if err != nil {
++		return fmt.Errorf("read mounts before removing Cilium directories: %w", err)
++	}
++	var errs []error
++	for _, path := range paths {
++		if err := removeCiliumDirectory(path, mounts); err != nil {
++			errs = append(errs, fmt.Errorf("remove Cilium directory %s: %w", path, err))
++		}
++	}
++	return errors.Join(errs...)
++}
++
++func removeCiliumDirectory(path string, mounts []*mountinfo.Info) error {
++	info, err := os.Lstat(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	if !info.IsDir() {
++		return fmt.Errorf("refusing non-directory or symlink root")
++	}
++	resolved, err := filepath.EvalSymlinks(path)
++	if err != nil {
++		return err
++	}
++	// All owned containers are stopped before this cleanup. Refuse existing
++	// mount boundaries rather than recursively deleting another filesystem.
++	for _, mount := range mounts {
++		mounted := filepath.Clean(mount.Mountpoint)
++		if mounted == path || strings.HasPrefix(mounted, path+string(filepath.Separator)) ||
++			mounted == resolved || strings.HasPrefix(mounted, resolved+string(filepath.Separator)) {
++			return fmt.Errorf("refusing mounted Cilium state at %s", mounted)
++		}
++	}
++	root, err := os.OpenRoot(path)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	opened, err := root.Stat(".")
++	if err != nil {
++		return err
++	}
++	if !os.SameFile(info, opened) {
++		return fmt.Errorf("Cilium directory changed before cleanup")
++	}
++	if err := removeCiliumDirectoryContents(root); err != nil {
++		return err
++	}
++	current, err := os.Lstat(path)
++	if err != nil {
++		return err
++	}
++	if !os.SameFile(info, current) {
++		return fmt.Errorf("Cilium directory changed during cleanup")
++	}
++	// RemoveAll(path) opens the parent directory, which strict confinement need
++	// not allow. The contents are gone, so Remove only needs the owned path.
++	return os.Remove(path)
++}
++
++func removeCiliumDirectoryContents(root *os.Root) error {
++	dir, err := root.Open(".")
++	if err != nil {
++		return err
++	}
++	entries, readErr := dir.ReadDir(-1)
++	if err := errors.Join(readErr, dir.Close()); err != nil {
++		return err
++	}
++	var errs []error
++	for _, entry := range entries {
++		if err := root.RemoveAll(entry.Name()); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errors.Join(errs...)
++}
+diff --git a/pkg/k8sd/features/cilium/cleanup_directories_test.go b/pkg/k8sd/features/cilium/cleanup_directories_test.go
+new file mode 100644
+index 0000000..b6396d9
+--- /dev/null
++++ b/pkg/k8sd/features/cilium/cleanup_directories_test.go
+@@ -0,0 +1,186 @@
++package cilium
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/moby/sys/mountinfo"
++)
++
++func makeCiliumState(t *testing.T, parent string) string {
++	t.Helper()
++	root := filepath.Join(parent, "cilium")
++	if err := os.MkdirAll(filepath.Join(root, "state", "endpoint"), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(root, "state", "endpoint", "config"), []byte("owned"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return root
++}
++
++func TestCleanupDirectoryDoesNotReadParent(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("root bypasses DAC directory read permission")
++	}
++	parent := t.TempDir()
++	root := makeCiliumState(t, parent)
++	if err := os.Chmod(parent, 0o300); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })
++	if err := os.RemoveAll(root); !errors.Is(err, os.ErrPermission) {
++		t.Fatalf("RemoveAll should reproduce denied parent read: %v", err)
++	}
++	if err := removeCiliumDirectory(root, nil); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("owned directory remains: %v", err)
++	}
++}
++
++func TestCleanupDirectoryPreservesSymlinkTargets(t *testing.T) {
++	parent := t.TempDir()
++	root := makeCiliumState(t, parent)
++	unrelated := filepath.Join(parent, "unrelated")
++	if err := os.Mkdir(unrelated, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	target := filepath.Join(unrelated, "keep")
++	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(unrelated, filepath.Join(root, "external")); err != nil {
++		t.Fatal(err)
++	}
++	if err := removeCiliumDirectory(root, nil); err != nil {
++		t.Fatal(err)
++	}
++	if data, err := os.ReadFile(target); err != nil || string(data) != "keep" {
++		t.Fatalf("unrelated symlink target changed: %s %v", data, err)
++	}
++	if err := os.Symlink(unrelated, root); err != nil {
++		t.Fatal(err)
++	}
++	if err := removeCiliumDirectory(root, nil); err == nil {
++		t.Fatal("symlink root accepted")
++	}
++	if _, err := os.Lstat(root); err != nil {
++		t.Fatalf("refused symlink root changed: %v", err)
++	}
++	if _, err := os.Stat(target); err != nil {
++		t.Fatalf("symlink root target changed: %v", err)
++	}
++}
++
++func TestCleanupDirectoryRefusesMountsBeforeDeletingAnything(t *testing.T) {
++	for _, nested := range []string{"", "state/endpoint"} {
++		t.Run(nested, func(t *testing.T) {
++			root := makeCiliumState(t, t.TempDir())
++			mounted := filepath.Join(root, nested)
++			mounts := []*mountinfo.Info{{Mountpoint: mounted}}
++			if err := removeCiliumDirectory(root, mounts); err == nil || !strings.Contains(err.Error(), "mount") {
++				t.Fatalf("mount accepted: %v", err)
++			}
++			if _, err := os.Stat(filepath.Join(root, "state", "endpoint", "config")); err != nil {
++				t.Fatalf("state changed despite mounted tree: %v", err)
++			}
++		})
++	}
++	root := makeCiliumState(t, t.TempDir())
++	if err := removeCiliumDirectory(root, []*mountinfo.Info{{Mountpoint: root + "-unrelated"}}); err != nil {
++		t.Fatalf("unrelated mount blocked cleanup: %v", err)
++	}
++}
++
++func TestCleanupDirectoryHandlesAbsentEmptyAndInvalidRoots(t *testing.T) {
++	root := filepath.Join(t.TempDir(), "cilium")
++	if err := removeCiliumDirectory(root, nil); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(root, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := removeCiliumDirectory(root, nil); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(root, []byte("keep"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := removeCiliumDirectory(root, nil); err == nil {
++		t.Fatal("non-directory root accepted")
++	}
++	if err := removeCiliumDirectory(filepath.Join(root, "child"), nil); err == nil {
++		t.Fatal("invalid path accepted")
++	}
++	if data, err := os.ReadFile(root); err != nil || string(data) != "keep" {
++		t.Fatalf("non-directory root changed: %s %v", data, err)
++	}
++}
++
++func TestCleanupDirectoriesAggregatesErrorsAndContinues(t *testing.T) {
++	parent := t.TempDir()
++	refused := filepath.Join(parent, "refused")
++	if err := os.WriteFile(refused, []byte("keep"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	root := makeCiliumState(t, parent)
++	otherRefused := filepath.Join(parent, "also-refused")
++	if err := os.Symlink(refused, otherRefused); err != nil {
++		t.Fatal(err)
++	}
++	err := removeCiliumDirectories([]string{refused, root, otherRefused}, func(mountinfo.FilterFunc) ([]*mountinfo.Info, error) { return nil, nil })
++	if err == nil || !strings.Contains(err.Error(), refused) || !strings.Contains(err.Error(), otherRefused) {
++		t.Fatalf("cleanup failures not aggregated: %v", err)
++	}
++	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("later owned directory not removed: %v", err)
++	}
++}
++
++func TestCleanupDirectoryReportsUnreadableState(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("root bypasses DAC directory read permission")
++	}
++	root := makeCiliumState(t, t.TempDir())
++	nested := filepath.Join(root, "state")
++	if err := os.Chmod(nested, 0); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = os.Chmod(nested, 0o700) })
++	if err := removeCiliumDirectory(root, nil); !errors.Is(err, os.ErrPermission) {
++		t.Fatalf("unreadable state failure hidden: %v", err)
++	}
++}
++
++func TestCleanupDirectoriesFailsClosedWhenMountsCannotBeRead(t *testing.T) {
++	root := makeCiliumState(t, t.TempDir())
++	expected := errors.New("mountinfo unavailable")
++	readMounts := func(mountinfo.FilterFunc) ([]*mountinfo.Info, error) { return nil, expected }
++	if err := removeCiliumDirectories([]string{root}, readMounts); !errors.Is(err, expected) {
++		t.Fatalf("mountinfo failure hidden: %v", err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "state", "endpoint", "config")); err != nil {
++		t.Fatalf("state deleted without checking mounts: %v", err)
++	}
++}
++
++func TestCleanupDirectoryDetectsMountUnderSymlinkAncestor(t *testing.T) {
++	parent := t.TempDir()
++	root := makeCiliumState(t, parent)
++	alias := filepath.Join(t.TempDir(), "alias")
++	if err := os.Symlink(parent, alias); err != nil {
++		t.Fatal(err)
++	}
++	mounts := []*mountinfo.Info{{Mountpoint: filepath.Join(root, "state")}}
++	if err := removeCiliumDirectory(filepath.Join(alias, "cilium"), mounts); err == nil {
++		t.Fatal("mounted state hidden by symlink ancestor accepted")
++	}
++	if _, err := os.Stat(filepath.Join(root, "state", "endpoint", "config")); err != nil {
++		t.Fatalf("mounted state changed: %v", err)
++	}
++}
+diff --git a/pkg/k8sd/features/cilium/cleanup_test.go b/pkg/k8sd/features/cilium/cleanup_test.go
+new file mode 100644
+index 0000000..10e8720
+--- /dev/null
++++ b/pkg/k8sd/features/cilium/cleanup_test.go
+@@ -0,0 +1,253 @@
++package cilium
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	snapmock "github.com/canonical/k8sd/pkg/snap/mock"
++)
++
++func TestCleanupNetworkAttemptsEveryFirewallAfterFailures(t *testing.T) {
++	for _, fail := range []bool{false, true} {
++		t.Run(fmt.Sprint(fail), func(t *testing.T) {
++			dir := t.TempDir()
++			record := filepath.Join(dir, "commands")
++			t.Setenv("PATH", dir)
++			t.Setenv("CLEANUP_TEST_RECORD", record)
++			for _, name := range []string{"iptables", "ip6tables", "iptables-legacy", "ip6tables-legacy"} {
++				save := "#!/bin/sh\nprintf '%s\\n' '$NAME-save' >> \"$CLEANUP_TEST_RECORD\"\nprintf '%s\\n' '-A KEEP -j ACCEPT' '-A CILIUM_TEST -j ACCEPT'\n"
++				save = strings.ReplaceAll(save, "$NAME", name)
++				if fail && name == "iptables" {
++					save += "exit 19\n"
++				}
++				restore := "#!/bin/sh\nprintf '%s\\n' '$NAME-restore' >> \"$CLEANUP_TEST_RECORD\"\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$CLEANUP_TEST_RECORD\"; done\n"
++				restore = strings.ReplaceAll(restore, "$NAME", name)
++				if fail && name == "ip6tables" {
++					restore += "exit 20\n"
++				}
++				if err := os.WriteFile(filepath.Join(dir, name+"-save"), []byte(save), 0o755); err != nil {
++					t.Fatal(err)
++				}
++				if err := os.WriteFile(filepath.Join(dir, name+"-restore"), []byte(restore), 0o755); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if fail {
++				if err := os.WriteFile(filepath.Join(dir, "cilium-cni"), nil, 0o755); err != nil {
++					t.Fatal(err)
++				}
++			}
++			s := &snapmock.Snap{Mock: snapmock.Mock{Strict: true, CNIBinDir: dir}}
++			err := CleanupNetwork(context.Background(), s)
++			if (err != nil) != fail {
++				t.Fatalf("cleanup failed=%t err=%v", fail, err)
++			}
++			if fail {
++				for _, message := range []string{"helper is missing", "read iptables", "restore ip6tables"} {
++					if !strings.Contains(err.Error(), message) {
++						t.Fatalf("missing error %q: %v", message, err)
++					}
++				}
++			}
++			data, err := os.ReadFile(record)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !strings.Contains(string(data), "ip6tables-legacy-restore") || !strings.Contains(string(data), "-A KEEP") || strings.Contains(string(data), "-A CILIUM_TEST") {
++				t.Fatalf("incorrect firewall cleanup: %s", data)
++			}
++		})
++	}
++}
++
++func TestCleanupHelperRejectsInvalidPathsBeforeExecution(t *testing.T) {
++	dir := t.TempDir()
++	s := &snapmock.Snap{Mock: snapmock.Mock{Strict: true, CNIBinDir: dir}}
++	helper := filepath.Join(dir, "cilium-dbg")
++	if err := os.Symlink(filepath.Join(dir, "missing"), helper); err != nil {
++		t.Fatal(err)
++	}
++	if err := cleanupCiliumState(context.Background(), s); err == nil {
++		t.Fatal("symlink helper accepted")
++	}
++	file := filepath.Join(dir, "not-a-directory")
++	if err := os.WriteFile(file, nil, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	s = &snapmock.Snap{Mock: snapmock.Mock{Strict: true, CNIBinDir: file}}
++	if err := cleanupCiliumState(context.Background(), s); err == nil {
++		t.Fatal("invalid helper directory accepted")
++	}
++}
++
++func TestCleanupHelperDoesNotRunWhenPIDFileCannotBeRemoved(t *testing.T) {
++	dir := t.TempDir()
++	pid := filepath.Join(dir, "pid")
++	if err := os.Mkdir(pid, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(pid, "keep"), nil, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := runCiliumCleanup(context.Background(), filepath.Join(dir, "must-not-run"), pid); err == nil || !strings.Contains(err.Error(), "PID file") {
++		t.Fatalf("PID removal failure lost: %v", err)
++	}
++}
++
++func TestCleanupHelperCancellationIsBounded(t *testing.T) {
++	dir := t.TempDir()
++	helper := filepath.Join(dir, "helper")
++	if err := os.WriteFile(helper, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
++	defer cancel()
++	start := time.Now()
++	if err := runCiliumCleanup(ctx, helper, filepath.Join(dir, "pid")); err == nil {
++		t.Fatal("cancellation did not fail cleanup")
++	}
++	if time.Since(start) > 5*time.Second {
++		t.Fatal("cleanup cancellation did not stop its child")
++	}
++}
++
++func TestMissingStrictCleanupHelperIsReported(t *testing.T) {
++	dir := t.TempDir()
++	s := &snapmock.Snap{Mock: snapmock.Mock{Strict: true, CNIBinDir: dir}}
++	if err := cleanupCiliumState(context.Background(), s); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "cilium-cni"), nil, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := cleanupCiliumState(context.Background(), s); err == nil || !strings.Contains(err.Error(), "helper is missing") {
++		t.Fatalf("missing helper not reported: %v", err)
++	}
++}
++
++type cleanupFileInfo struct {
++	os.FileInfo
++	uid uint32
++}
++
++func (i cleanupFileInfo) Sys() any { return &syscall.Stat_t{Uid: i.uid} }
++
++func TestCleanupHelperRejectsUntrustedExecutables(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "helper")
++	if err := os.WriteFile(path, nil, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Lstat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := validateCleanupHelper(cleanupFileInfo{info, 0}); err != nil {
++		t.Fatal(err)
++	}
++	if err := validateCleanupHelper(cleanupFileInfo{info, 1000}); err == nil {
++		t.Fatal("accepted user-owned helper")
++	}
++	if err := os.Chmod(path, 0o777); err != nil {
++		t.Fatal(err)
++	}
++	info, _ = os.Lstat(path)
++	if err := validateCleanupHelper(cleanupFileInfo{info, 0}); err == nil {
++		t.Fatal("accepted writable helper")
++	}
++	link := path + "-link"
++	if err := os.Symlink(path, link); err != nil {
++		t.Fatal(err)
++	}
++	info, _ = os.Lstat(link)
++	if err := validateCleanupHelper(cleanupFileInfo{info, 0}); err == nil {
++		t.Fatal("accepted symlink helper")
++	}
++}
++
++func TestCleanupHelperUsesOwnedPathAndReportsFailure(t *testing.T) {
++	dir := t.TempDir()
++	helper := filepath.Join(dir, "helper")
++	pidFile := filepath.Join(dir, "cilium.pid")
++	for _, status := range []string{"0", "17"} {
++		script := "#!/bin/sh\n[ \"$*\" = 'post-uninstall-cleanup --all-state --force' ] || exit 90\nexit " + status + "\n"
++		if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(pidFile, nil, 0o600); err != nil {
++			t.Fatal(err)
++		}
++		err := runCiliumCleanup(context.Background(), helper, pidFile)
++		if (err == nil) != (status == "0") {
++			t.Fatalf("status %s: %v", status, err)
++		}
++		if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
++			t.Fatalf("PID file retained: %v", err)
++		}
++	}
++}
++
++func TestCleanupStateDispatchAndErrorPreservation(t *testing.T) {
++	for _, strict := range []bool{false, true} {
++		for _, trusted := range []bool{false, true} {
++			t.Run(fmt.Sprintf("strict=%t/trusted=%t", strict, trusted), func(t *testing.T) {
++				dir := t.TempDir()
++				helper := filepath.Join(dir, "cilium-dbg")
++				// A failing helper still leaves strict directory cleanup to attempt.
++				if err := os.WriteFile(helper, []byte("#!/bin/sh\nexit 17\n"), 0o755); err != nil {
++					t.Fatal(err)
++				}
++				statHelper := func(path string) (os.FileInfo, error) {
++					if path != helper {
++						t.Fatalf("unexpected helper path: %s", path)
++					}
++					info, err := os.Lstat(path)
++					if err != nil {
++						return nil, err
++					}
++					uid := uint32(0)
++					if !trusted {
++						uid = 1000
++					}
++					return cleanupFileInfo{info, uid}, nil
++				}
++				calls := 0
++				helperCalls := 0
++				helperErr := errors.New("helper cleanup failed")
++				runCleanup := func(_ context.Context, actualHelper, pidFile string) error {
++					helperCalls++
++					if actualHelper != helper || pidFile != "/var/run/cilium/cilium.pid" {
++						t.Fatalf("unexpected cleanup paths: %s %s", actualHelper, pidFile)
++					}
++					return helperErr
++				}
++				directoryErr := errors.New("directory cleanup failed")
++				cleanupDirectories := func() error { calls++; return directoryErr }
++				s := &snapmock.Snap{Mock: snapmock.Mock{Strict: strict, CNIBinDir: dir}}
++				err := cleanupCiliumStateWith(context.Background(), s, statHelper, runCleanup, cleanupDirectories)
++				if strict && !trusted {
++					if calls != 0 || helperCalls != 0 || err == nil || !strings.Contains(err.Error(), "root-owned") {
++						t.Fatalf("unsafe helper allowed cleanup: calls=%d err=%v", calls, err)
++					}
++					return
++				}
++				if helperCalls != 1 || !errors.Is(err, helperErr) {
++					t.Fatalf("helper failure lost: %v", err)
++				}
++				if strict {
++					if calls != 1 || !errors.Is(err, directoryErr) {
++						t.Fatalf("directory cleanup failure lost: calls=%d err=%v", calls, err)
++					}
++				} else if calls != 0 || errors.Is(err, directoryErr) {
++					t.Fatalf("classic used strict fallback: calls=%d err=%v", calls, err)
++				}
++			})
++		}
++	}
++}
+diff --git a/pkg/k8sd/features/cilium/cni_paths_test.go b/pkg/k8sd/features/cilium/cni_paths_test.go
+index cd8dc1a..4f96640 100644
+--- a/pkg/k8sd/features/cilium/cni_paths_test.go
++++ b/pkg/k8sd/features/cilium/cni_paths_test.go
+@@ -51,6 +51,13 @@ func TestNetworkUsesSnapCNIBinDir(t *testing.T) {
+ 			if got := values["cni"].(map[string]any)["binPath"]; got != test.binDir {
+ 				t.Fatalf("Cilium binPath = %q, want snap CNI directory %q", got, test.binDir)
+ 			}
++			install, exists := values["k8sInstallCleanupHelper"]
++			if test.strict && install != true {
++				t.Fatal("strict deployment must install the cleanup helper")
++			}
++			if !test.strict && exists {
++				t.Fatal("classic deployment changed")
++			}
+ 		})
+ 	}
+ }
+diff --git a/pkg/k8sd/features/cilium/network.go b/pkg/k8sd/features/cilium/network.go
+index 3142ff9..150bb19 100644
+--- a/pkg/k8sd/features/cilium/network.go
++++ b/pkg/k8sd/features/cilium/network.go
+@@ -218,6 +218,8 @@ func ApplyNetwork(ctx context.Context, snap snap.Snap, s mctypes.State, apiserve
+ 	}
+ 
+ 	if snap.Strict() {
++		// The existing CNI installer copies the helper from its effective agent image.
++		values["k8sInstallCleanupHelper"] = true
+ 		bpfMnt, err := GetMountPath("bpf")
+ 		if err != nil {
+ 			err = fmt.Errorf("failed to get bpf mount path: %w", err)
+diff --git a/pkg/snap/util/cleanup/cleanup.go b/pkg/snap/util/cleanup/cleanup.go
+index fc9930b..b757239 100644
+--- a/pkg/snap/util/cleanup/cleanup.go
++++ b/pkg/snap/util/cleanup/cleanup.go
+@@ -2,6 +2,7 @@ package cleanup
+ 
+ import (
+ 	"context"
++	"errors"
+ 
+ 	"github.com/canonical/k8sd/pkg/snap"
+ 	"github.com/canonical/k8sd/pkg/snap/util/cleanup/internal"
+@@ -15,13 +16,13 @@ func SyncISCSIDevices(ctx context.Context) {
+ }
+ 
+ // [DANGER] Cleanup containers and runtime state. Note that the order of operations below is crucial.
+-// Cleanup is done on a best-effort basis, and errors are logged but not returned.
+-func TryCleanupContainers(ctx context.Context, s snap.Snap) {
++// Cleanup is best-effort; process cleanup failures are returned to the caller.
++func TryCleanupContainers(ctx context.Context, s snap.Snap) error {
+ 	mountHelper := mountutils.NewUnixMountHelper()
+ 	netnsHelper := netnsutils.NewUnixNetworkNSHelper()
+ 
+-	internal.RemoveContainers(ctx)
+-	internal.RemoveNetworkNamespaces(ctx, netnsHelper)
++	ownedNamespaces, cleanupErr := internal.RemoveContainers(ctx)
++	namespaceErr := internal.RemoveNetworkNamespaces(ctx, netnsHelper, ownedNamespaces)
+ 
+ 	sidsToLogout := internal.GetISCSISessionsToLogout(ctx, s, mountHelper)
+ 
+@@ -32,6 +33,7 @@ func TryCleanupContainers(ctx context.Context, s snap.Snap) {
+ 
+ 	internal.RemovePluginSockets(ctx)
+ 	internal.RemoveLoopDevices(ctx, mountHelper)
++	return errors.Join(cleanupErr, namespaceErr)
+ }
+ 
+ // TryCleanupContainerdPaths attempts to clean up all containerd directories which were
+diff --git a/pkg/snap/util/cleanup/internal/containers.go b/pkg/snap/util/cleanup/internal/containers.go
+index 6b2395d..379c122 100644
+--- a/pkg/snap/util/cleanup/internal/containers.go
++++ b/pkg/snap/util/cleanup/internal/containers.go
+@@ -2,37 +2,173 @@ package internal
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"strconv"
++	"strings"
++	"time"
+ 
+-	"github.com/canonical/k8sd/pkg/log"
+ 	"github.com/canonical/k8sd/pkg/utils/shims"
++	"golang.org/x/sys/unix"
+ )
+ 
+-func RemoveContainers(ctx context.Context) {
+-	log := log.FromContext(ctx)
++type containerProcess struct {
++	pid       int
++	startTime string
++}
++
++// RemoveContainers kills snap-owned shim descendants before releasing their
++// named network namespaces. The kill syscall is available on strict Core bases
++// whose seccomp policies do not yet allow Go's pidfd_send_signal implementation.
++func RemoveContainers(ctx context.Context) (map[string]bool, error) {
+ 	pids, err := shims.RunningContainerdShimPIDs(ctx)
+ 	if err != nil {
+-		log.Error(err, "failed to get containerd shim PIDs")
+-		return
++		return nil, fmt.Errorf("list container processes: %w", err)
+ 	}
++	processes, identityErr := captureContainerProcesses(pids)
++	namespaces, nsErr := containerNetworkNamespaces(pids, "/proc", "/run/netns")
++	err = killContainerProcesses(ctx, processes, unix.Kill, containerProcessIdentity)
++	return namespaces, errors.Join(identityErr, nsErr, err)
++}
+ 
++func captureContainerProcesses(pids []string) ([]containerProcess, error) {
++	var processes []containerProcess
++	var errs []error
+ 	for _, pid := range pids {
+-		intPid, err := strconv.Atoi(pid)
++		n, err := strconv.Atoi(pid)
++		if err != nil || n <= 1 {
++			errs = append(errs, fmt.Errorf("invalid container PID %q", pid))
++			continue
++		}
++		start, err := containerProcessIdentity(n)
+ 		if err != nil {
+-			log.Error(err, "failed to convert PID to integer", "pid", pid)
++			errs = append(errs, err)
+ 			continue
+ 		}
++		if start != "" {
++			processes = append(processes, containerProcess{n, start})
++		}
++	}
++	return processes, errors.Join(errs...)
++}
+ 
+-		process, err := os.FindProcess(intPid)
++func killContainerProcesses(ctx context.Context, processes []containerProcess, kill func(int, unix.Signal) error, identity func(int) (string, error)) error {
++	var errs []error
++	var killed []containerProcess
++	for _, process := range processes {
++		if err := ctx.Err(); err != nil {
++			return errors.Join(append(errs, err)...)
++		}
++		if process.pid <= 1 || process.startTime == "" {
++			errs = append(errs, fmt.Errorf("invalid container identity %+v", process))
++			continue
++		}
++		start, err := identity(process.pid)
+ 		if err != nil {
+-			log.Error(err, "failed to find containerd shim PID", "pid", intPid)
++			errs = append(errs, err)
++			continue
++		}
++		if start != process.startTime {
+ 			continue
+ 		}
++		if err := kill(process.pid, unix.SIGKILL); err != nil {
++			if !errors.Is(err, unix.ESRCH) {
++				errs = append(errs, fmt.Errorf("kill container PID %d: %w", process.pid, err))
++			}
++			continue
++		}
++		killed = append(killed, process)
++	}
++	for _, process := range killed {
++		if err := waitContainerExit(ctx, process, identity); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errors.Join(errs...)
++}
++
++func waitContainerExit(ctx context.Context, process containerProcess, identity func(int) (string, error)) error {
++	for {
++		start, err := identity(process.pid)
++		if err != nil {
++			return fmt.Errorf("check container PID %d: %w", process.pid, err)
++		}
++		if start != process.startTime {
++			return nil
++		}
++		select {
++		case <-ctx.Done():
++			return fmt.Errorf("wait for container PID %d: %w", process.pid, ctx.Err())
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++}
+ 
+-		if err := process.Kill(); err != nil {
+-			log.Error(err, "failed to kill containerd shim PID", "pid", intPid)
++func containerProcessIdentity(pid int) (string, error) {
++	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
++	if errors.Is(err, os.ErrNotExist) {
++		return "", nil
++	}
++	if err != nil {
++		return "", err
++	}
++	// comm can contain spaces and parentheses. State follows its final ')'.
++	end := strings.LastIndex(string(stat), ") ")
++	if end < 0 || len(stat) <= end+2 {
++		return "", fmt.Errorf("invalid process stat")
++	}
++	fields := strings.Fields(string(stat[end+2:]))
++	if len(fields) < 20 {
++		return "", fmt.Errorf("invalid process stat fields")
++	}
++	if fields[0] == "Z" || fields[0] == "X" {
++		return "", nil
++	}
++	return fields[19], nil
++}
++
++func containerNetworkNamespaces(pids []string, procDir, netnsDir string) (map[string]bool, error) {
++	owned := make(map[string]bool)
++	var namespaces []os.FileInfo
++	var errs []error
++	for _, pid := range pids {
++		info, err := os.Stat(filepath.Join(procDir, pid, "ns", "net"))
++		if errors.Is(err, os.ErrNotExist) {
++			continue
++		}
++		if err != nil {
++			errs = append(errs, err)
+ 			continue
+ 		}
++		namespaces = append(namespaces, info)
++	}
++	entries, err := os.ReadDir(netnsDir)
++	if errors.Is(err, os.ErrNotExist) {
++		return owned, errors.Join(errs...)
++	}
++	if err != nil {
++		return owned, errors.Join(append(errs, err)...)
++	}
++	for _, entry := range entries {
++		if !strings.HasPrefix(entry.Name(), "cni-") {
++			continue
++		}
++		info, err := os.Stat(filepath.Join(netnsDir, entry.Name()))
++		if errors.Is(err, os.ErrNotExist) {
++			continue
++		}
++		if err != nil {
++			errs = append(errs, err)
++			continue
++		}
++		for _, ns := range namespaces {
++			if os.SameFile(ns, info) {
++				owned[entry.Name()] = true
++				break
++			}
++		}
+ 	}
++	return owned, errors.Join(errs...)
+ }
+diff --git a/pkg/snap/util/cleanup/internal/containers_test.go b/pkg/snap/util/cleanup/internal/containers_test.go
+new file mode 100644
+index 0000000..01f6dd1
+--- /dev/null
++++ b/pkg/snap/util/cleanup/internal/containers_test.go
+@@ -0,0 +1,171 @@
++package internal
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strconv"
++	"testing"
++
++	"golang.org/x/sys/unix"
++)
++
++func TestContainerProcessIdentityAndCapture(t *testing.T) {
++	pid := os.Getpid()
++	start, err := containerProcessIdentity(pid)
++	if err != nil || start == "" {
++		t.Fatalf("own process identity: %q err=%v", start, err)
++	}
++	got, err := captureContainerProcesses([]string{strconv.Itoa(pid), "bad", "0", "1", "2147483647"})
++	if err == nil {
++		t.Fatal("invalid PIDs were not reported")
++	}
++	if !reflect.DeepEqual(got, []containerProcess{{pid, start}}) {
++		t.Fatalf("captured processes: %+v", got)
++	}
++}
++
++func TestRemoveContainersWithNoOwnedProcesses(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
++	owned, err := RemoveContainers(context.Background())
++	if err != nil || len(owned) != 0 {
++		t.Fatalf("empty cleanup: %v err=%v", owned, err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte("#!/bin/sh\nexit 18\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := RemoveContainers(context.Background()); err == nil {
++		t.Fatal("ignored process enumeration failure")
++	}
++}
++
++func TestKillContainerProcessesReportsIdentityErrors(t *testing.T) {
++	want := errors.New("cannot inspect process")
++	err := killContainerProcesses(context.Background(), []containerProcess{{42, "1"}}, func(int, unix.Signal) error { t.Fatal("signaled unverified process"); return nil }, func(int) (string, error) { return "", want })
++	if !errors.Is(err, want) {
++		t.Fatalf("identity error lost: %v", err)
++	}
++	err = waitContainerExit(context.Background(), containerProcess{42, "1"}, func(int) (string, error) { return "", want })
++	if !errors.Is(err, want) {
++		t.Fatalf("wait identity error lost: %v", err)
++	}
++}
++
++func TestContainerNetworkNamespacesRejectsUnreadableDirectories(t *testing.T) {
++	file := filepath.Join(t.TempDir(), "file")
++	if err := os.WriteFile(file, nil, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := containerNetworkNamespaces([]string{"42"}, file, file); err == nil {
++		t.Fatal("invalid namespace roots were ignored")
++	}
++	owned, err := containerNetworkNamespaces(nil, t.TempDir(), file+"-absent")
++	if err != nil || len(owned) != 0 {
++		t.Fatalf("absent namespace directory: %v err=%v", owned, err)
++	}
++}
++
++func TestContainerNetworkNamespacesPreservesOtherRuntimes(t *testing.T) {
++	root := t.TempDir()
++	proc := filepath.Join(root, "proc")
++	netns := filepath.Join(root, "netns")
++	if err := os.MkdirAll(filepath.Join(proc, "42", "ns"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(netns, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for _, name := range []string{"cni-owned", "cni-other"} {
++		if err := os.WriteFile(filepath.Join(netns, name), nil, 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := os.Link(filepath.Join(netns, "cni-owned"), filepath.Join(proc, "42", "ns", "net")); err != nil {
++		t.Fatal(err)
++	}
++	got, err := containerNetworkNamespaces([]string{"42", "43"}, proc, netns)
++	if err != nil || !reflect.DeepEqual(got, map[string]bool{"cni-owned": true}) {
++		t.Fatalf("owned namespaces = %v, err=%v", got, err)
++	}
++}
++
++func TestKillContainerProcessesUsesKillAndContinuesAfterFailure(t *testing.T) {
++	var called []int
++	processes := []containerProcess{{-1, "1"}, {0, "1"}, {1, "1"}, {22, "1"}, {23, "1"}, {24, "1"}}
++	err := killContainerProcesses(context.Background(), processes, func(pid int, signal unix.Signal) error {
++		if signal != unix.SIGKILL {
++			t.Fatalf("unexpected signal %v", signal)
++		}
++		called = append(called, pid)
++		if pid == 22 {
++			return unix.EPERM
++		}
++		if pid == 23 {
++			return unix.ESRCH
++		}
++		return nil
++	}, func(pid int) (string, error) {
++		for _, calledPID := range called {
++			if calledPID == pid {
++				return "", nil
++			}
++		}
++		return "1", nil
++	})
++	if !errors.Is(err, unix.EPERM) {
++		t.Fatalf("want signal failure, got %v", err)
++	}
++	if !reflect.DeepEqual(called, []int{22, 23, 24}) {
++		t.Fatalf("unsafe/incomplete PIDs %v", called)
++	}
++}
++
++func TestKillContainerProcessesWaitsForExit(t *testing.T) {
++	checks := 0
++	err := killContainerProcesses(context.Background(), []containerProcess{{42, "1"}}, func(int, unix.Signal) error { return nil }, func(int) (string, error) {
++		checks++
++		if checks < 3 {
++			return "1", nil
++		}
++		return "", nil
++	})
++	if err != nil || checks != 3 {
++		t.Fatalf("cleanup returned before process exit: checks=%d err=%v", checks, err)
++	}
++}
++
++func TestKillContainerProcessesHonorsDeadline(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	err := killContainerProcesses(ctx, []containerProcess{{42, "1"}}, func(int, unix.Signal) error { return nil }, func(int) (string, error) { return "1", nil })
++	if !errors.Is(err, context.Canceled) {
++		t.Fatalf("want cancellation, got %v", err)
++	}
++}
++
++func TestKillContainerProcessesDoesNotSignalReusedPID(t *testing.T) {
++	err := killContainerProcesses(context.Background(), []containerProcess{{42, "1"}}, func(int, unix.Signal) error { t.Fatal("signaled reused PID"); return nil }, func(int) (string, error) { return "2", nil })
++	if err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestKillContainerProcessesDoesNotWaitForReusedPID(t *testing.T) {
++	calls := 0
++	err := killContainerProcesses(context.Background(), []containerProcess{{42, "1"}}, func(int, unix.Signal) error { return nil }, func(int) (string, error) {
++		calls++
++		if calls == 1 {
++			return "1", nil
++		}
++		return "2", nil
++	})
++	if err != nil || calls != 2 {
++		t.Fatalf("waited on reused PID: %v calls=%d", err, calls)
++	}
++}
+diff --git a/pkg/snap/util/cleanup/internal/network_namespaces.go b/pkg/snap/util/cleanup/internal/network_namespaces.go
+index d353e9e..adddd99 100644
+--- a/pkg/snap/util/cleanup/internal/network_namespaces.go
++++ b/pkg/snap/util/cleanup/internal/network_namespaces.go
+@@ -2,22 +2,26 @@ package internal
+ 
+ import (
+ 	"context"
+-	"strings"
++	"errors"
+ 
+-	"github.com/canonical/k8sd/pkg/log"
+ 	netnsutils "github.com/canonical/k8sd/pkg/utils/netns"
+ )
+ 
+-func RemoveNetworkNamespaces(ctx context.Context, netnsHelper netnsutils.NetworkNamespaceManager) {
+-	log := log.FromContext(ctx)
+-
++func RemoveNetworkNamespaces(ctx context.Context, netnsHelper netnsutils.NetworkNamespaceManager, owned map[string]bool) error {
++	if len(owned) == 0 {
++		return nil
++	}
++	var errs []error
+ 	err := netnsHelper.ForEachNetworkNamespace(ctx, func(ctx context.Context, namespace string) error {
+-		if strings.HasPrefix(namespace, "cni-") {
+-			return netnsHelper.DeleteNetworkNamespace(ctx, namespace)
++		if owned[namespace] {
++			if err := netnsHelper.DeleteNetworkNamespace(ctx, namespace); err != nil {
++				errs = append(errs, err)
++			}
+ 		}
+ 		return nil
+ 	})
+ 	if err != nil {
+-		log.Error(err, "failed to iterate and delete network namespaces")
++		errs = append(errs, err)
+ 	}
++	return errors.Join(errs...)
+ }
+diff --git a/pkg/snap/util/cleanup/internal/network_namespaces_errors_test.go b/pkg/snap/util/cleanup/internal/network_namespaces_errors_test.go
+new file mode 100644
+index 0000000..298aa2c
+--- /dev/null
++++ b/pkg/snap/util/cleanup/internal/network_namespaces_errors_test.go
+@@ -0,0 +1,42 @@
++package internal_test
++
++import (
++	"context"
++	"errors"
++	"github.com/canonical/k8sd/pkg/snap/util/cleanup/internal"
++	"testing"
++)
++
++type failingNamespaceManager struct {
++	deleteErr, iterateErr error
++	deleted               []string
++}
++
++func (m *failingNamespaceManager) ForEachNetworkNamespace(ctx context.Context, callback func(context.Context, string) error) error {
++	for _, name := range []string{"cni-owned", "cni-unrelated"} {
++		if err := callback(ctx, name); err != nil {
++			return err
++		}
++	}
++	return m.iterateErr
++}
++
++func (m *failingNamespaceManager) DeleteNetworkNamespace(_ context.Context, name string) error {
++	m.deleted = append(m.deleted, name)
++	return m.deleteErr
++}
++
++func TestRemoveNetworkNamespacesReportsAllFailures(t *testing.T) {
++	removeErr, listErr := errors.New("delete denied"), errors.New("enumeration failed")
++	manager := &failingNamespaceManager{deleteErr: removeErr, iterateErr: listErr}
++	err := internal.RemoveNetworkNamespaces(context.Background(), manager, map[string]bool{"cni-owned": true})
++	if !errors.Is(err, removeErr) || !errors.Is(err, listErr) {
++		t.Fatalf("lost errors: %v", err)
++	}
++	if len(manager.deleted) != 1 || manager.deleted[0] != "cni-owned" {
++		t.Fatalf("touched unrelated namespace: %v", manager.deleted)
++	}
++	if err := internal.RemoveNetworkNamespaces(context.Background(), manager, nil); err != nil {
++		t.Fatalf("enumerated namespaces without ownership: %v", err)
++	}
++}
+diff --git a/pkg/snap/util/cleanup/internal/network_namespaces_test.go b/pkg/snap/util/cleanup/internal/network_namespaces_test.go
+index 89d115f..e50e31c 100644
+--- a/pkg/snap/util/cleanup/internal/network_namespaces_test.go
++++ b/pkg/snap/util/cleanup/internal/network_namespaces_test.go
+@@ -20,7 +20,7 @@ func TestRemoveNetworkNamespaces(t *testing.T) {
+ 
+ 	// Create namespaces: one cni- and one non-cni-
+ 	cniNS := "cni-test-ns"
+-	otherNS := "other-ns"
++	otherNS := "cni-other-runtime"
+ 	cniPath := filepath.Join(netnsDir, cniNS)
+ 	otherPath := filepath.Join(netnsDir, otherNS)
+ 	g.Expect(os.Mkdir(cniPath, 0o755)).To(Succeed())
+@@ -28,7 +28,7 @@ func TestRemoveNetworkNamespaces(t *testing.T) {
+ 	g.Expect(cniPath).To(BeAnExistingFile())
+ 	g.Expect(otherPath).To(BeAnExistingFile())
+ 
+-	internal.RemoveNetworkNamespaces(ctx, helper)
++	internal.RemoveNetworkNamespaces(ctx, helper, map[string]bool{cniNS: true})
+ 
+ 	// cni- namespace should be deleted, other should remain
+ 	g.Expect(cniPath).ToNot(BeAnExistingFile())
+diff --git a/pkg/utils/shims/shims.go b/pkg/utils/shims/shims.go
+index 36d89ef..27d4f5f 100644
+--- a/pkg/utils/shims/shims.go
++++ b/pkg/utils/shims/shims.go
+@@ -3,13 +3,15 @@ package shims
+ import (
+ 	"context"
+ 	"fmt"
++	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"regexp"
+ 	"strings"
+ )
+ 
+-// reBinaryName is the regular expression used to match containerd shim and /pause processes.
+-var reBinaryName = regexp.MustCompile(`(^(/var/lib/snapd)?/snap/k8s/.*/bin/containerd-shim-runc-v2|^/pause$)`)
++// Only snap-owned shims establish ownership; unrelated pause processes do not.
++var reBinaryName = regexp.MustCompile(`^(/var/lib/snapd)?/snap/k8s/[^/]+/bin/containerd-shim-runc-v2( |$)`)
+ 
+ // RunningContainerdShimPIDs returns a list of all the pids on the system that have been started by a containerd shim.
+ func RunningContainerdShimPIDs(ctx context.Context) ([]string, error) {
+@@ -22,8 +24,9 @@ func RunningContainerdShimPIDs(ctx context.Context) ([]string, error) {
+ }
+ 
+ type processInfo struct {
+-	command   string
+-	parentPID string
++	command    string
++	parentPID  string
++	executable string
+ }
+ 
+ // listAllSystemProcesses returns a map of all running processes on the host.
+@@ -44,9 +47,22 @@ func listAllSystemProcesses(ctx context.Context) (map[string]processInfo, error)
+ 			continue
+ 		}
+ 
++		command := strings.Join(parts[2:], " ")
++		var executable string
++		if reBinaryName.MatchString(command) {
++			executable, err = os.Readlink(filepath.Join("/proc", parts[0], "exe"))
++			if os.IsNotExist(err) {
++				continue
++			}
++			if err != nil {
++				return nil, fmt.Errorf("read shim executable for PID %s: %w", parts[0], err)
++			}
++			executable = strings.TrimSuffix(executable, " (deleted)")
++		}
+ 		result[parts[0]] = processInfo{
+-			parentPID: parts[1],
+-			command:   strings.Join(parts[2:], " "),
++			parentPID:  parts[1],
++			command:    command,
++			executable: executable,
+ 		}
+ 	}
+ 
+@@ -66,7 +82,7 @@ func makeShallowChildPIDs(procs map[string]processInfo) map[string][]string {
+ func findShimPIDs(procs map[string]processInfo) []string {
+ 	var result []string
+ 	for pid, info := range procs {
+-		if reBinaryName.MatchString(info.command) {
++		if reBinaryName.MatchString(info.command) && reBinaryName.MatchString(info.executable) {
+ 			result = append(result, pid)
+ 		}
+ 	}
+@@ -77,8 +93,8 @@ func findShimPIDs(procs map[string]processInfo) []string {
+ func findAllChildren(startPIDs []string, shallowChildPIDs map[string][]string) []string {
+ 	var result []string
+ 	for _, pid := range startPIDs {
+-		result = append(result, pid)
+ 		result = append(result, findAllChildren(shallowChildPIDs[pid], shallowChildPIDs)...)
++		result = append(result, pid)
+ 	}
+ 	return result
+ }
+diff --git a/pkg/utils/shims/shims_test.go b/pkg/utils/shims/shims_test.go
+new file mode 100644
+index 0000000..8152abc
+--- /dev/null
++++ b/pkg/utils/shims/shims_test.go
+@@ -0,0 +1,59 @@
++package shims
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++func TestCleanupReadsExecutableInsteadOfTrustingProcessArguments(t *testing.T) {
++	dir := t.TempDir()
++	// The current test binary cannot become a snap shim by spoofing argv[0].
++	output := fmt.Sprintf("invalid\n%d 1 /snap/k8s/42/bin/containerd-shim-runc-v2 -namespace k8s.io\n2147483647 1 /snap/k8s/42/bin/containerd-shim-runc-v2\n99 1 unrelated\n", os.Getpid())
++	ps := "#!/bin/sh\nprintf '%s' '" + output + "'\n"
++	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte(ps), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
++	procs, err := listAllSystemProcesses(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if procs[fmt.Sprint(os.Getpid())].executable == "" {
++		t.Fatal("did not read executable identity")
++	}
++	pids, err := RunningContainerdShimPIDs(context.Background())
++	if err != nil || len(pids) != 0 {
++		t.Fatalf("selected spoofed/exited shims: %v err=%v", pids, err)
++	}
++}
++
++func TestCleanupReportsProcessEnumerationFailure(t *testing.T) {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte("#!/bin/sh\nexit 19\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
++	if _, err := RunningContainerdShimPIDs(context.Background()); err == nil {
++		t.Fatal("process enumeration failure was ignored")
++	}
++}
++
++func TestCleanupSelectsOnlySnapShimDescendants(t *testing.T) {
++	procs := map[string]processInfo{
++		"10": {command: "/snap/k8s/42/bin/containerd-shim-runc-v2 -namespace k8s.io", executable: "/snap/k8s/42/bin/containerd-shim-runc-v2", parentPID: "1"},
++		"11": {command: "/pause", parentPID: "10"},
++		"12": {command: "workload", parentPID: "11"},
++		"20": {command: "/pause", parentPID: "1"},
++		"21": {command: "/snap/other/42/bin/containerd-shim-runc-v2", parentPID: "1"},
++		"22": {command: "/snap/k8s/42/bin/containerd-shim-runc-v2-other", parentPID: "1"},
++		"23": {command: "/snap/k8s/42/bin/containerd-shim-runc-v2", executable: "/usr/bin/sleep", parentPID: "1"},
++	}
++	got := findAllChildren(findShimPIDs(procs), makeShallowChildPIDs(procs))
++	if want := []string{"12", "11", "10"}; !reflect.DeepEqual(got, want) {
++		t.Fatalf("cleanup PIDs = %v, want children before owned shim %v", got, want)
++	}
++}

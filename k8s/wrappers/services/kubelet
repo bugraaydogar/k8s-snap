@@ -7,6 +7,17 @@ k8s::common::setup_env
 k8s::common::is_strict && k8s::kubelet::ensure_shared_root_dir
 
 k8s::util::wait_containerd_socket
+
+if k8s::common::is_strict && [ -e "$SNAP_COMMON/lock/storage-refresh" ]; then
+  # Operate on local CRI sandboxes, so workers need no admin kubeconfig. A failed
+  # cleanup leaves the marker and stops startup; systemd can retry safely.
+  if ! k8s::cmd::k8s x-cleanup storage-refresh --timeout=2m; then
+    echo "Storage refresh recovery failed; refusing to start kubelet." >&2
+    exit 1
+  fi
+  rm "$SNAP_COMMON/lock/storage-refresh"
+fi
+
 k8s::util::wait_kube_apiserver
 
 k8s::common::execute kubelet

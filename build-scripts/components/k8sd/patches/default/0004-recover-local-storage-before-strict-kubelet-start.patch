@@ -1,0 +1,322 @@
+From: K8s builder bot <k8s-bot@canonical.com>
+Subject: [PATCH] recover local storage before strict kubelet startup
+
+Remove only managed local rawfile CSI node sandboxes through CRI before
+kubelet resumes after refresh. Retained CSI sandboxes otherwise keep the
+old snap mount namespace and cannot propagate new volume mounts to kubelet.
+Keep application sandboxes and volume data intact. Fail on runtime errors
+so the service wrapper can retain its recovery marker and retry safely.
+
+Use local runtime access for both control-plane and worker nodes, without
+Kubernetes administrator credentials. Add the matching Kubernetes CRI API
+module and regression tests for scope, partial failure and cancellation.
+---
+ cmd/k8s/k8s_x_cleanup.go                      |  18 ++++
+ go.mod                                        |   3 +-
+ go.sum                                        |   2 +
+ pkg/snap/util/cleanup/storage/storage.go      |  70 ++++++++++++++
+ pkg/snap/util/cleanup/storage/storage_test.go | 134 ++++++++++++++++++++++++++
+ 5 files changed, 226 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/k8s/k8s_x_cleanup.go b/cmd/k8s/k8s_x_cleanup.go
+index 1023382..b322553 100644
+--- a/cmd/k8s/k8s_x_cleanup.go
++++ b/cmd/k8s/k8s_x_cleanup.go
+@@ -7,6 +7,7 @@ import (
+ 	cmdutil "github.com/canonical/k8sd/cmd/util"
+ 	"github.com/canonical/k8sd/pkg/k8sd/features"
+ 	"github.com/canonical/k8sd/pkg/snap/util/cleanup"
++	"github.com/canonical/k8sd/pkg/snap/util/cleanup/storage"
+ 	"github.com/spf13/cobra"
+ )
+ 
+@@ -59,6 +60,22 @@ func newXCleanupCmd(env cmdutil.ExecutionEnvironment) *cobra.Command {
+ 	}
+ 	cleanupContainerdCmd.Flags().DurationVar(&opts.timeout, "timeout", 5*time.Minute, "the max time to wait for the command to execute")
+ 
++	var storageTimeout time.Duration
++	cleanupStorageCmd := &cobra.Command{
++		Use:   "storage-refresh",
++		Short: "Recover local storage sandboxes before strict kubelet startup",
++		Args:  cobra.NoArgs,
++		RunE: func(cmd *cobra.Command, args []string) error {
++			if !env.Snap.Strict() {
++				return nil
++			}
++			ctx, cancel := context.WithTimeout(cmd.Context(), storageTimeout)
++			defer cancel()
++			return storage.Restart(ctx, env.Snap.ContainerdSocketPath())
++		},
++	}
++	cleanupStorageCmd.Flags().DurationVar(&storageTimeout, "timeout", 2*time.Minute, "the max time to wait for storage recovery")
++
+ 	cmd := &cobra.Command{
+ 		Use:    "x-cleanup",
+ 		Short:  "Cleanup left-over cluster resources",
+@@ -69,6 +86,7 @@ func newXCleanupCmd(env cmdutil.ExecutionEnvironment) *cobra.Command {
+ 	cmd.AddCommand(cleanupNetworkCmd)
+ 	cmd.AddCommand(cleanupContainersCmd)
+ 	cmd.AddCommand(cleanupContainerdCmd)
++	cmd.AddCommand(cleanupStorageCmd)
+ 
+ 	return cmd
+ }
+diff --git a/go.mod b/go.mod
+index fa1ccb1..c6cdef8 100644
+--- a/go.mod
++++ b/go.mod
+@@ -20,6 +20,7 @@ require (
+ 	golang.org/x/net v0.59.0
+ 	golang.org/x/sync v0.23.0
+ 	golang.org/x/sys v0.48.0
++	google.golang.org/grpc v1.83.2
+ 	gopkg.in/yaml.v2 v2.4.0
+ 	helm.sh/helm/v3 v3.22.0
+ 	k8s.io/api v0.37.1
+@@ -27,6 +28,7 @@ require (
+ 	k8s.io/apimachinery v0.37.1
+ 	k8s.io/cli-runtime v0.37.1
+ 	k8s.io/client-go v0.37.1
++	k8s.io/cri-api v0.37.1
+ 	k8s.io/klog/v2 v2.140.0
+ 	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
+ 	sigs.k8s.io/controller-runtime v0.25.2
+@@ -146,7 +148,6 @@ require (
+ 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20260810153831-ec0a7760b754 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754 // indirect
+-	google.golang.org/grpc v1.83.2 // indirect
+ 	google.golang.org/protobuf v1.36.12 // indirect
+ 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
+ 	gopkg.in/inf.v0 v0.9.1 // indirect
+diff --git a/go.sum b/go.sum
+index be3a441..dab8163 100644
+--- a/go.sum
++++ b/go.sum
+@@ -461,6 +461,8 @@ k8s.io/client-go v0.37.1 h1:QTv/5ha4jAHtW9qxxVBkQVFBRDb4jHfFopQqqMdc+wM=
+ k8s.io/client-go v0.37.1/go.mod h1:dnAPtTnCNY38Ho04D2KdY1F4IKausa9UbqaAZKl60SY=
+ k8s.io/component-base v0.37.1 h1:93DMmlENnK7gNLkL4pMqLO5M/HVf3p3sM4q/GasLveY=
+ k8s.io/component-base v0.37.1/go.mod h1:bBrdziT4dreQG5lzTaPVxBwsZe1oxphG+ZVdD56dQWQ=
++k8s.io/cri-api v0.37.1 h1:Y1fmZuvHIlP/XBO4pbqFZtxzzDmX9iDSFfDrhUoB170=
++k8s.io/cri-api v0.37.1/go.mod h1:6V8Gb6wznJYVPToj8CLxgbxsFeeGIswNZCE7cy+xT90=
+ k8s.io/klog/v2 v2.140.0 h1:Tf+J3AH7xnUzZyVVXhTgGhEKnFqye14aadWv7bzXdzc=
+ k8s.io/klog/v2 v2.140.0/go.mod h1:o+/RWfJ6PwpnFn7OyAG3QnO47BFsymfEfrz6XyYSSp0=
+ k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad h1:oXImqH8mQNk7PmvzKhmN3ddJoY6OnyM225MXwGHPm0A=
+diff --git a/pkg/snap/util/cleanup/storage/storage.go b/pkg/snap/util/cleanup/storage/storage.go
+new file mode 100644
+index 0000000..dfe45d3
+--- /dev/null
++++ b/pkg/snap/util/cleanup/storage/storage.go
+@@ -0,0 +1,70 @@
++// Package storage recovers node-local CSI mount propagation after a snap refresh.
++package storage
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"strings"
++
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/grpc/status"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++)
++
++// Restart removes only the local managed rawfile CSI node sandboxes. Kubelet
++// must be stopped while this runs; it recreates the sandboxes in the current
++// mount namespace when it starts. Application sandboxes and volumes are kept.
++// The caller must supply a bounded context and retain its retry marker on error.
++func Restart(ctx context.Context, socket string) error {
++	if !filepath.IsAbs(socket) {
++		return fmt.Errorf("containerd socket must be an absolute path")
++	}
++	conn, err := grpc.NewClient("unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		return fmt.Errorf("failed to create local runtime client: %w", err)
++	}
++	defer conn.Close()
++	return restartSandboxes(ctx, runtimeapi.NewRuntimeServiceClient(conn))
++}
++
++func restartSandboxes(ctx context.Context, runtime runtimeapi.RuntimeServiceClient) error {
++	response, err := runtime.ListPodSandbox(ctx, &runtimeapi.ListPodSandboxRequest{}, grpc.WaitForReady(true))
++	if err != nil {
++		return fmt.Errorf("failed to list storage sandboxes: %w", err)
++	}
++	for _, sandbox := range response.Items {
++		if !managedNodeSandbox(sandbox) {
++			continue
++		}
++		if sandbox.Id == "" {
++			return fmt.Errorf("managed storage sandbox has no runtime ID")
++		}
++		if _, err := runtime.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: sandbox.Id}, grpc.WaitForReady(true)); err != nil {
++			if status.Code(err) == codes.NotFound {
++				continue
++			}
++			return fmt.Errorf("failed to stop storage sandbox %s: %w", sandbox.Metadata.Name, err)
++		}
++		if _, err := runtime.RemovePodSandbox(ctx, &runtimeapi.RemovePodSandboxRequest{PodSandboxId: sandbox.Id}, grpc.WaitForReady(true)); err != nil && status.Code(err) != codes.NotFound {
++			return fmt.Errorf("failed to remove storage sandbox %s: %w", sandbox.Metadata.Name, err)
++		}
++	}
++	return nil
++}
++
++func managedNodeSandbox(sandbox *runtimeapi.PodSandbox) bool {
++	metadata := sandbox.GetMetadata()
++	if metadata == nil || metadata.Namespace != "kube-system" || metadata.Uid == "" ||
++		!strings.HasPrefix(metadata.Name, "ck-storage-rawfile-csi-node-") {
++		return false
++	}
++	labels := sandbox.GetLabels()
++	return labels["app.kubernetes.io/name"] == "rawfile-csi" &&
++		labels["app.kubernetes.io/instance"] == "ck-storage" && labels["component"] == "node" &&
++		labels["io.kubernetes.pod.name"] == metadata.Name &&
++		labels["io.kubernetes.pod.namespace"] == metadata.Namespace &&
++		labels["io.kubernetes.pod.uid"] == metadata.Uid
++}
+diff --git a/pkg/snap/util/cleanup/storage/storage_test.go b/pkg/snap/util/cleanup/storage/storage_test.go
+new file mode 100644
+index 0000000..b63835f
+--- /dev/null
++++ b/pkg/snap/util/cleanup/storage/storage_test.go
+@@ -0,0 +1,134 @@
++package storage
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"testing"
++
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++)
++
++type storageRuntime struct {
++	runtimeapi.RuntimeServiceClient
++	sandboxes                   []*runtimeapi.PodSandbox
++	calls                       []string
++	listErr, stopErr, removeErr error
++}
++
++func (r *storageRuntime) ListPodSandbox(context.Context, *runtimeapi.ListPodSandboxRequest, ...grpc.CallOption) (*runtimeapi.ListPodSandboxResponse, error) {
++	return &runtimeapi.ListPodSandboxResponse{Items: r.sandboxes}, r.listErr
++}
++func (r *storageRuntime) StopPodSandbox(_ context.Context, req *runtimeapi.StopPodSandboxRequest, _ ...grpc.CallOption) (*runtimeapi.StopPodSandboxResponse, error) {
++	r.calls = append(r.calls, "stop:"+req.PodSandboxId)
++	return &runtimeapi.StopPodSandboxResponse{}, r.stopErr
++}
++func (r *storageRuntime) RemovePodSandbox(_ context.Context, req *runtimeapi.RemovePodSandboxRequest, _ ...grpc.CallOption) (*runtimeapi.RemovePodSandboxResponse, error) {
++	r.calls = append(r.calls, "remove:"+req.PodSandboxId)
++	return &runtimeapi.RemovePodSandboxResponse{}, r.removeErr
++}
++
++func localStorageSandbox() *runtimeapi.PodSandbox {
++	return &runtimeapi.PodSandbox{
++		Id:       "storage-id",
++		Metadata: &runtimeapi.PodSandboxMetadata{Name: "ck-storage-rawfile-csi-node-abcde", Namespace: "kube-system", Uid: "storage-uid"},
++		Labels:   map[string]string{"app.kubernetes.io/name": "rawfile-csi", "app.kubernetes.io/instance": "ck-storage", "component": "node", "io.kubernetes.pod.name": "ck-storage-rawfile-csi-node-abcde", "io.kubernetes.pod.namespace": "kube-system", "io.kubernetes.pod.uid": "storage-uid"},
++	}
++}
++
++func TestRefreshLocalStorageSelectsOnlyManagedNodeSandboxes(t *testing.T) {
++	for _, change := range []struct {
++		name  string
++		alter func(*runtimeapi.PodSandbox)
++	}{
++		{"namespace", func(p *runtimeapi.PodSandbox) { p.Metadata.Namespace = "apps" }},
++		{"name", func(p *runtimeapi.PodSandbox) { p.Metadata.Name = "application" }},
++		{"release", func(p *runtimeapi.PodSandbox) { p.Labels["app.kubernetes.io/instance"] = "other" }},
++		{"component", func(p *runtimeapi.PodSandbox) { p.Labels["component"] = "controller" }},
++		{"uid", func(p *runtimeapi.PodSandbox) { p.Labels["io.kubernetes.pod.uid"] = "other" }},
++		{"labels", func(p *runtimeapi.PodSandbox) { p.Labels = nil }},
++		{"metadata", func(p *runtimeapi.PodSandbox) { p.Metadata = nil }},
++	} {
++		t.Run(change.name, func(t *testing.T) {
++			foreign := localStorageSandbox()
++			change.alter(foreign)
++			r := &storageRuntime{sandboxes: []*runtimeapi.PodSandbox{foreign, localStorageSandbox()}}
++			if err := restartSandboxes(context.Background(), r); err != nil {
++				t.Fatal(err)
++			}
++			if want := []string{"stop:storage-id", "remove:storage-id"}; !reflect.DeepEqual(r.calls, want) {
++				t.Fatalf("got %v, want %v", r.calls, want)
++			}
++		})
++	}
++}
++
++func TestRefreshLocalStorageErrorsAndRetry(t *testing.T) {
++	for _, stage := range []string{"list", "stop", "remove"} {
++		t.Run(stage, func(t *testing.T) {
++			failure := errors.New("runtime unavailable")
++			r := &storageRuntime{sandboxes: []*runtimeapi.PodSandbox{localStorageSandbox()}}
++			switch stage {
++			case "list":
++				r.listErr = failure
++			case "stop":
++				r.stopErr = failure
++			case "remove":
++				r.removeErr = failure
++			}
++			if err := restartSandboxes(context.Background(), r); !errors.Is(err, failure) {
++				t.Fatalf("got %v", err)
++			}
++			if stage == "stop" && !reflect.DeepEqual(r.calls, []string{"stop:storage-id"}) {
++				t.Fatalf("removed sandbox after failed stop: %v", r.calls)
++			}
++			r.listErr = nil
++			r.stopErr = nil
++			r.removeErr = nil
++			r.calls = nil
++			if err := restartSandboxes(context.Background(), r); err != nil {
++				t.Fatal(err)
++			}
++			if !reflect.DeepEqual(r.calls, []string{"stop:storage-id", "remove:storage-id"}) {
++				t.Fatal(r.calls)
++			}
++		})
++	}
++}
++
++func TestRefreshLocalStorageAlreadyGone(t *testing.T) {
++	for _, stage := range []string{"stop", "remove"} {
++		t.Run(stage, func(t *testing.T) {
++			r := &storageRuntime{sandboxes: []*runtimeapi.PodSandbox{localStorageSandbox()}}
++			if stage == "stop" {
++				r.stopErr = status.Error(codes.NotFound, "gone")
++			} else {
++				r.removeErr = status.Error(codes.NotFound, "gone")
++			}
++			if err := restartSandboxes(context.Background(), r); err != nil {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++
++func TestRefreshLocalStorageEmpty(t *testing.T) {
++	r := &storageRuntime{}
++	if err := restartSandboxes(context.Background(), r); err != nil {
++		t.Fatal(err)
++	}
++	if len(r.calls) != 0 {
++		t.Fatal(r.calls)
++	}
++}
++
++func TestRefreshLocalStorageCanceled(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := Restart(ctx, "/tmp/no-storage-runtime.sock"); err == nil {
++		t.Fatal("canceled runtime request succeeded")
++	}
++}
+-- 
+2.43.0

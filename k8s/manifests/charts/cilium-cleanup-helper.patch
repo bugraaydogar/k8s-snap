@@ -1,0 +1,20 @@
+--- a/cilium/templates/cilium-agent/daemonset.yaml
++++ b/cilium/templates/cilium-agent/daemonset.yaml
+@@ -808,7 +808,17 @@
+         image: {{ include "cilium.image" .Values.image | quote }}
+         imagePullPolicy: {{ .Values.image.pullPolicy }}
+         command:
++          {{- if .Values.k8sInstallCleanupHelper }}
++          - "/bin/sh"
++          - "-ec"
++          - |
++            /install-plugin.sh
++            cp /usr/bin/cilium-dbg /host/opt/cni/bin/.cilium-dbg.tmp
++            chmod 0755 /host/opt/cni/bin/.cilium-dbg.tmp
++            mv -f /host/opt/cni/bin/.cilium-dbg.tmp /host/opt/cni/bin/cilium-dbg
++          {{- else }}
+           - "/install-plugin.sh"
++          {{- end }}
+         {{- with .Values.cni.resources }}
+         resources:
+           {{- toYaml . | trim | nindent 10 }}

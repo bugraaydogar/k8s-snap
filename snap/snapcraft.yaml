@@ -7,7 +7,7 @@ description: |-
   on any infrastructure
 license: GPL-3.0
 grade: stable
-confinement: classic
+confinement: strict
 # Note(ben): Snapcraft does not expose its base for part builds, so we need to set it manually.
 # Feature request tracked in https://github.com/canonical/snapcraft/issues/5614
 # For now, remember to also update OPENSSL_MODULES and etcd part BASE when bumping this version.
@@ -83,6 +83,7 @@ parts:
       esac
 
   k8sd:
+    after: [build-deps]
     source: build-scripts/components/k8sd
     build-attributes: [enable-patchelf]
     plugin: nil
@@ -204,8 +205,15 @@ parts:
       - openssl
       - procps
       - tar
+      # k8sd reads service state through systemctl. Strict apps cannot execute
+      # the host binary; its read-only D-Bus access uses system-observe below.
+      - systemd
       - util-linux
     stage:
+      # Use the Core base journalctl with its matching private systemd library.
+      # Only the staged systemctl client is needed for daemon service queries.
+      - -bin/journalctl
+      - -usr/bin/journalctl
       - -etc/bash_completion.d
       - -etc/cron.d
       - -etc/depmod.d
@@ -257,6 +265,21 @@ parts:
 apps:
   k8s:
     command: k8s/wrappers/commands/k8s
+    plugs:
+      - firewall-control
+      - home-read-all
+      - home
+      - kernel-module-observe
+      - kubernetes-support
+      - login-session-observe
+      - log-observe
+      - mount-observe
+      - network
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - system-observe
   containerd:
     command: k8s/wrappers/services/containerd
     daemon: notify
@@ -267,43 +290,212 @@ apps:
     restart-condition: always
     start-timeout: 5m
     before: [kubelet]
+    plugs:
+      - cifs-mount
+      - cilium-delete-queue-lock
+      - cilium-module-load
+      - docker-privileged
+      - firewall-control
+      - fuse-support
+      - kernel-crypto-api
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - opengl
   etcd:
     command: k8s/wrappers/services/etcd
     install-mode: disable
     daemon: simple
     before: [kube-apiserver]
+    plugs:
+      - network-bind
   k8sd:
     command: k8s/wrappers/services/k8sd
     install-mode: enable
     daemon: simple
+    environment:
+      # A snap mount namespace is not a systemd chroot. Query the host manager
+      # through the read-only system-observe D-Bus policy.
+      SYSTEMD_IGNORE_CHROOT: "1"
+    plugs:
+      - kubernetes-support
+      - mount-observe
+      - network
+      - network-bind
+      - system-observe
   kubelet:
     install-mode: disable
     command: k8s/wrappers/services/kubelet
     daemon: simple
     after: [containerd]
+    plugs:
+      - docker-privileged
+      - firewall-control
+      - hardware-observe
+      - kernel-module-observe
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - process-control
+      - system-observe
   kube-apiserver:
     install-mode: disable
     command: k8s/wrappers/services/kube-apiserver
     daemon: simple
     before: [kubelet, kube-controller-manager, kube-proxy, kube-scheduler]
     stop-timeout: 5s
+    plugs:
+      - docker-privileged
+      - firewall-control
+      - hardware-observe
+      - kernel-module-observe
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - process-control
+      - system-observe
   kube-controller-manager:
     install-mode: disable
     command: k8s/wrappers/services/kube-controller-manager
     daemon: simple
     after: [kube-apiserver]
+    plugs:
+      - docker-privileged
+      - firewall-control
+      - hardware-observe
+      - kernel-module-observe
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - process-control
+      - system-observe
   kube-proxy:
     install-mode: disable
     command: k8s/wrappers/services/kube-proxy
     daemon: simple
     after: [kube-apiserver]
+    plugs:
+      - docker-privileged
+      - firewall-control
+      - hardware-observe
+      - kernel-module-observe
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - process-control
+      - system-observe
   kube-scheduler:
     install-mode: disable
     command: k8s/wrappers/services/kube-scheduler
     daemon: simple
     after: [kube-apiserver]
+    plugs:
+      - docker-privileged
+      - firewall-control
+      - hardware-observe
+      - kernel-module-observe
+      - kubernetes-support
+      - mount-observe
+      - network-bind
+      - network-control
+      - network-observe
+      - opengl
+      - process-control
+      - system-observe
   k8s-apiserver-proxy:
     install-mode: disable
     command: k8s/wrappers/services/k8s-apiserver-proxy
     daemon: simple
     before: [kubelet, kube-proxy]
+    plugs:
+      - network-bind
+
+layout:
+  # Kubernetes paths
+  /etc/kubernetes:
+    bind: $SNAP_COMMON/etc/kubernetes
+  /etc/cni/net.d:
+    bind: $SNAP_COMMON/etc/cni/net.d
+  /opt/cni/bin:
+    bind: $SNAP_COMMON/opt/cni/bin
+  /var/lib/kubelet:
+    bind: $SNAP_COMMON/var/lib/kubelet
+  # Logs and temporary files
+  /var/log/pods:
+    bind: $SNAP_COMMON/var/log/pods
+  /var/log/containers:
+    bind: $SNAP_COMMON/var/log/containers
+  # CNI and compatibility paths.
+  /var/lib/cni:
+    bind: $SNAP_COMMON/var/lib/cni
+  /var/lib/calico:
+    bind: $SNAP_COMMON/var/lib/calico
+  # Extras
+  /usr/local:
+    bind: $SNAP_COMMON/usr/local
+  /usr/libexec:
+    bind: $SNAP_COMMON/usr/libexec
+  /var/lib/kube-proxy:
+    bind: $SNAP_COMMON/var/lib/kube-proxy
+  /etc/service/enabled:
+    bind: $SNAP_COMMON/etc/service/enabled
+  /etc/nanorc:
+    bind-file: $SNAP_COMMON/etc/nanorc
+
+plugs:
+  home-read-all:
+    interface: home
+    read: all
+  docker-privileged:
+    interface: docker-support
+    privileged-containers: true
+  # Cilium CNI locks the host delete queue when it cannot reach the agent.
+  cilium-delete-queue-lock:
+    interface: system-files
+    write:
+      - /run/cilium/deleteQueue/lockfile
+  # The remove hook runs Cilium's own teardown after stopping its containers.
+  cilium-cleanup:
+    interface: system-files
+    read:
+      - /sys/fs/bpf
+    write:
+      - /run/cilium
+      - /var/lib/cilium
+      - /sys/fs/bpf/cilium
+      - /sys/fs/bpf/tc/globals
+  # Cilium Ingress requires iptable_raw and xt_socket for datapath L7 redirection.
+  cilium-module-load:
+    interface: kernel-module-load
+    modules:
+      - name: iptable_raw
+        load: "on-boot"
+      - name: xt_socket
+        load: "on-boot"
+
+hooks:
+  remove:
+    plugs:
+      - cilium-cleanup
+      - kubernetes-support
+      - network
+      - network-bind
+      - network-control
+      - network-observe
+      - process-control
+      - firewall-control
+      - system-observe
+      - mount-observe

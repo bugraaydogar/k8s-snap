@@ -21,8 +21,10 @@ You can try to apply the profile manually by running:
 "
 fi
 
-# Re-exec outside of apparmor confinement
-if [ -d /sys/kernel/security/apparmor ] && [ "$(cat /proc/self/attr/current)" != "unconfined" ]; then
+# Re-exec outside of apparmor confinement for classic confinement only.
+if ! k8s::common::is_strict &&
+   [ -d /sys/kernel/security/apparmor ] &&
+   [ "$(cat /proc/self/attr/current)" != "unconfined" ]; then
     exec aa-exec -p unconfined -- "$0" "$@"
 fi
 

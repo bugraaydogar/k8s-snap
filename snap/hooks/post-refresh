@@ -20,3 +20,11 @@ fi
 # run a custom post-refresh hook in the k8sd service.
 mkdir -p "$SNAP_COMMON/lock"
 touch "$SNAP_COMMON/lock/post-refresh"
+
+# snapd runs this hook before starting services. CSI sandboxes which survived
+# the refresh retain the previous mount namespace; recover them before kubelet
+# can issue volume operations in the new namespace. Keep this marker separate
+# from the one consumed by k8sd.
+if k8s::common::is_strict; then
+  touch "$SNAP_COMMON/lock/storage-refresh"
+fi
