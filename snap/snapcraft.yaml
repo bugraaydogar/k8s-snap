@@ -291,6 +291,7 @@ apps:
       # through the read-only system-observe D-Bus policy.
       SYSTEMD_IGNORE_CHROOT: "1"
     plugs:
+      - k8sd-host-files
       - kubernetes-support
       - mount-observe
       - network
@@ -406,6 +407,23 @@ plugs:
   docker-privileged:
     interface: docker-support
     privileged-containers: true
+  # WORKAROUND, needs engineering review: exact paths k8sd was denied on
+  # UC22/UC24. Not a design; each entry is a k8sd behaviour to fix upstream.
+  #  - /run/systemd/private: k8sd polls service state via systemctl. This
+  #    effectively grants systemd manager access; replace with a /proc or
+  #    snapctl based lookup in k8sd.
+  #  - /run/xtables.lock, /etc/iproute2: the node-configuration controller
+  #    runs 'kube-proxy --cleanup' (iptables) on every reconcile, although
+  #    kube-proxy is disabled. iptables will still lack net_admin.
+  #  - /etc/modprobe.d: modprobe reads its configuration directory.
+  k8sd-host-files:
+    interface: system-files
+    read:
+      - /etc/iproute2
+      - /etc/modprobe.d
+    write:
+      - /run/systemd/private
+      - /run/xtables.lock
   # Cilium CNI locks the host delete queue when it cannot reach the agent.
   cilium-delete-queue-lock:
     interface: system-files
